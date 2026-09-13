@@ -40,7 +40,7 @@ bun scripts/verify-pr.ts          # tier 3 (~10min) — commit + cross-target + 
 |------|---------|------------|--------|
 | 1 — per-turn   | PostToolUse hook on `.zig` Write/Edit | `bun scripts/verify-fast.ts` | <2s |
 | 2 — per-commit | Stop hook + pre-commit                | `bun scripts/verify-commit.ts` | ~30s |
-| 3 — per-PR     | Forgejo `verify-pr.yaml`              | `bun scripts/verify-pr.ts` | ~10min |
+| 3 — per-PR     | GitHub `verify-pr.yaml`               | `bun scripts/verify-pr.ts` | ~10min |
 | 4 — per-release| Manual `/release`                     | `bun scripts/verify-release.ts` | hours |
 
 Each tier runs every check from the tier below it first, then adds its

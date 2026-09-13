@@ -1,3 +1,9 @@
+# Tier 3 quality gate. The readiness record for this change is enforced by the
+# canonical broker in Eugene3dotdev/dotfiles, which posts the `Readiness Gate`
+# status this repository's branch protection requires; no Linear credential
+# lives here. What this workflow proves — the Zig gate, evals and coverage —
+# the broker records as evidence on the Linear issue when these checks are
+# green (see .readiness/adapter.yaml, `check_name`).
 name: verify-pr
 
 on:
@@ -10,6 +16,9 @@ concurrency:
   group: verify-pr-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   zig-gate:
     name: Zig quality gate
@@ -20,6 +29,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Install mise
         uses: jdx/mise-action@v2
@@ -41,20 +51,8 @@ jobs:
       - name: Bun install
         run: bun ci
 
-      - name: Run verify-pr gate (readiness check first, then tiers 2-3)
-        env:
-          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+      - name: Run verify-pr gate
         run: bun scripts/verify-pr.ts
-
-      - name: Record source-validation evidence on the Linear issue
-        env:
-          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          set -euo pipefail
-          issue="$(mise x aqua:nushell/nushell@0.109.1 -- nu --no-config-file .readiness/readiness.nu issue)"
-          mise x aqua:nushell/nushell@0.109.1 -- nu --no-config-file .readiness/readiness.nu evidence --issue "$issue" --kind source-validation --control-point forgejo:verify-pr --ref "$HEAD_SHA" --run "$RUN_URL" --note "verify-pr tier: cross-target matrix, safety modes, docs, bounded fuzz"
 
   evals:
     name: Eval structural check
@@ -64,6 +62,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install Bun
         uses: oven-sh/setup-bun@v2
@@ -86,6 +86,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Install mise
         uses: jdx/mise-action@v2

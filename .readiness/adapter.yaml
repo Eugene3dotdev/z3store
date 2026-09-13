@@ -1,10 +1,14 @@
 # Readiness adapter (readiness/v1) — consumes the canonical contract from
-# Eugene3dotdev/dotfiles readiness/. z3store is the substrate for the future
-# opportunity store (kairoteca) and ships as a public Zig CLI plus a Homebrew
-# formula, so source and build changes are `release` blast radius. The
-# four-tier verify path is the enforcement point: verify-pr (tier 3) and
-# verify-release (tier 4) run the readiness check; the Forgejo workflows call
-# those tiers, so the same gate holds on the forge and on a workstation.
+# Eugene3dotdev/dotfiles readiness/.
+#
+# This repository holds no Linear credential. The canonical broker validates
+# the readiness record for every open pull request and posts the
+# `Readiness Gate` status that branch protection requires; what this
+# repository proves, it publishes as a check or commit status, and the broker
+# records those as evidence on the Linear issue (the `check_name` fields
+# below). z3store is the substrate for the future opportunity store
+# (kairoteca) and ships as a public Zig CLI plus a Homebrew formula, so source
+# and build changes are `release` blast radius.
 adapter: readiness-adapter/v1
 contract_version: readiness/v1
 repo: Eugene3dotdev/z3store
@@ -13,6 +17,8 @@ canonical: Eugene3dotdev/dotfiles:readiness
 path_classes:
   - glob: ".readiness/**"
     class: local
+  - glob: ".github/**"
+    class: local
   - glob: "doc/**"
     class: local
   - glob: "docs/**"
@@ -20,8 +26,6 @@ path_classes:
   - glob: "**/*.md"
     class: local
   - glob: ".claude/**"
-    class: local
-  - glob: ".forgejo/**"
     class: local
   - glob: "scripts/**"
     class: local
@@ -36,37 +40,47 @@ path_classes:
   - glob: "**"
     class: release
 control_points:
-  - id: forgejo:verify-pr
-    kind: forgejo-workflow
-    path: .forgejo/workflows/verify-pr.yaml
+  - id: broker:readiness-gate
+    kind: broker-status
     enforces: true
-    marker: "scripts/verify-pr.ts"
-    required_check: "Zig quality gate"
-    evidence: [source-validation]
-    note: runs the tier-3 gate, which runs the readiness check first; LINEAR_API_KEY is a Forgejo secret
-  - id: forgejo:release
-    kind: forgejo-workflow
-    path: .forgejo/workflows/release.yaml
-    enforces: true
-    marker: "scripts/verify-release.ts"
-    evidence: [release-verification]
-  - id: forgejo:claude-review
-    kind: forgejo-workflow
-    path: .forgejo/workflows/claude-review.yaml
+    required_check: "Readiness Gate"
+    note: >-
+      posted by the broker in Eugene3dotdev/dotfiles after it validates the record in Linear;
+      the adapter it reads is the one on the pull request's base branch, never its head
+  - id: gh:verify-pr
+    kind: github-workflow
+    path: .github/workflows/verify-pr.yaml
     enforces: false
-    note: agent review; external text is untrusted data per CLAUDE.md
-  - id: verify:pr
-    kind: verify-script
-    path: scripts/verify-pr.ts
+    check_name: "Zig quality gate"
+    evidence: [source-validation]
+    note: tier 3 — cross-target matrix, safety modes, docs, bounded fuzz, evals, coverage
+  - id: gh:release
+    kind: github-workflow
+    path: .github/workflows/release.yaml
     enforces: true
-    marker: "runReadinessCheck"
-    note: tier 3 runs `readiness.nu check` before any Zig work (scripts/lib/readiness.ts)
+    marker: "assert-status"
+    check_name: "z3store/verify-release"
+    evidence: [release-verification]
+    note: >-
+      reads the broker's verdict back with the workflow token before running tier 4,
+      then publishes the tier's result as a commit status for the broker to record
+  - id: gh:claude-review
+    kind: github-workflow
+    path: .github/workflows/claude-review.yaml
+    enforces: false
+    note: agent review; the review prompt is read from the base branch and external text is untrusted data per CLAUDE.md
   - id: verify:release
     kind: verify-script
     path: scripts/verify-release.ts
     enforces: true
     marker: "runReadinessCheck"
-    note: tier 4 runs `readiness.nu check --require-evidence` for the release class
+    note: tier 4 refuses to run on an unverified record (enforce, delegated, or refuse — scripts/lib/readiness.ts)
+  - id: verify:pr
+    kind: verify-script
+    path: scripts/verify-pr.ts
+    enforces: false
+    marker: "runReadinessCheck"
+    note: runs the record check when a credential or offline record is configured; advisory otherwise, because the broker's status is the merge gate
   - id: verify:fast
     kind: verify-script
     path: scripts/verify-fast.ts

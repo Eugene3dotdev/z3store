@@ -1,0 +1,83 @@
+# Tier 4 release verification. A release is `release` blast radius, so it may
+# not run unless the readiness record for this commit is ready. That is proven
+# without a Linear credential: the canonical broker writes its verdict as the
+# `Readiness Gate` commit status, and the first step reads it back with the
+# workflow token. The tier's own result is published as a commit status in
+# turn, which the broker records on the Linear issue as release-verification
+# evidence.
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to verify (informational only; the workflow does not push or publish)."
+        required: false
+        type: string
+      fuzz_budget_seconds:
+        description: "Deep-fuzz wall-clock budget for verify-release."
+        required: false
+        default: "7200"
+        type: string
+
+permissions:
+  contents: read
+  statuses: write
+
+jobs:
+  verify-release:
+    name: Tier 4 release verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      FUZZ_BUDGET_SECONDS: ${{ inputs.fuzz_budget_seconds }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install mise
+        uses: jdx/mise-action@v2
+        with:
+          cache: true
+          install: true
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.0
+
+      - name: Install Zig 0.16.0 via mise
+        run: mise install zig@0.16.0
+
+      - name: Verify Zig toolchain resolves
+        run: mise x zig@0.16.0 -- zig version
+
+      - name: Verify the vendored readiness validator
+        run: mise x aqua:nushell/nushell@0.109.1 -- nu --no-config-file .readiness/readiness.nu lock
+
+      - name: Require a green readiness gate on this commit
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: mise x aqua:nushell/nushell@0.109.1 -- nu --no-config-file .readiness/readiness.nu assert-status
+
+      - name: Bun install
+        run: bun ci
+
+      - name: Run verify-release gate
+        env:
+          Z3_READINESS_MODE: delegated
+        run: bun scripts/verify-release.ts
+
+      - name: Publish the release verification as a commit status
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          STATE: ${{ job.status == 'success' && 'success' || 'failure' }}
+        run: |
+          mise x aqua:nushell/nushell@0.109.1 -- nu --no-config-file .readiness/readiness.nu publish-status \
+            --context "z3store/verify-release" --state "$STATE" --url "$RUN_URL" \
+            --description "tier 4: reproducible rebuild, deep fuzz, SBOM"

@@ -26,6 +26,14 @@ const LOCK_SCHEMA = "readiness-lock/v1"
 const REGISTRY_SCHEMA = "readiness-registry/v1"
 const LINEAR_URL = "https://api.linear.app/graphql"
 const GITHUB_API = "https://api.github.com"
+# The broker in the canonical repository is the enforcement point for every
+# other repository: it evaluates open pull requests against Linear and posts
+# this status context, which branch protection requires. Consuming
+# repositories therefore hold no Linear credential at all.
+const BROKER_KIND = "broker-status"
+const BROKER_CONTEXT = "Readiness Gate"
+const BROKER_WORKFLOW = "readiness-broker.yml"
+const BROKER_MAX_AGE_MINUTES = 60
 const MAX_VALIDITY_DAYS = 30
 const DEFAULT_VALIDITY_DAYS = 14
 const DEFAULT_ISSUE_PREFIX = "TEO"
@@ -169,30 +177,53 @@ def adapter-path [root] {
   if ($hit | is-empty) { null } else { $hit | first }
 }
 
+# Validate an adapter record. `src` only names the source in error messages,
+# so the same rules apply to a file on disk and to a blob fetched from the
+# GitHub API by the broker.
+export def validate-adapter [a, src: string] {
+  if (($a | get -o adapter) != $ADAPTER_SCHEMA) { error make {msg: $"($src): adapter schema must be ($ADAPTER_SCHEMA)"} }
+  if (($a | get -o contract_version) not-in $SUPPORTED_RECORD_CONTRACTS) { error make {msg: $"($src): contract_version ($a | get -o contract_version) is not supported by this validator \(($CONTRACT)\)"} }
+  for key in ["repo" "path_classes" "control_points"] {
+    if (($a | get -o $key) == null) { error make {msg: $"($src): missing required key ($key)"} }
+  }
+  for pc in $a.path_classes {
+    if (($pc | get -o glob) == null or ($pc | get -o class) == null) { error make {msg: $"($src): every path_classes entry needs glob and class"} }
+    if ($pc.class not-in (class-names)) { error make {msg: $"($src): unknown class ($pc.class) in path_classes"} }
+    for e in ($pc | get -o extra_evidence | default []) {
+      if ($e not-in $EVIDENCE_KINDS) { error make {msg: $"($src): unknown extra_evidence kind ($e)"} }
+    }
+  }
+  for cp in $a.control_points {
+    for key in ["id" "kind" "enforces"] {
+      if (($cp | get -o $key) == null) { error make {msg: $"($src): control point missing ($key)"} }
+    }
+    # A broker-status control point is enforced by the canonical repository's
+    # broker, which posts a commit status; it owns no file in this repository,
+    # so a path would be a lie the audit would then try to verify.
+    if $cp.kind == $BROKER_KIND {
+      if (($cp | get -o path) != null) { error make {msg: $"($src): control point ($cp.id) is a ($BROKER_KIND) and must not declare a path"} }
+      if (($cp | get -o required_check) == null) { error make {msg: $"($src): control point ($cp.id) must declare the required_check the broker posts"} }
+    } else if (($cp | get -o path) == null) {
+      error make {msg: $"($src): control point ($cp.id) missing path"}
+    }
+    for e in ($cp | get -o evidence | default []) {
+      if ($e not-in $EVIDENCE_KINDS) { error make {msg: $"($src): control point ($cp.id) names unknown evidence kind ($e)"} }
+    }
+  }
+  $a
+}
+
 def load-adapter [root] {
   let p = (adapter-path $root)
   if ($p == null) {
     error make {msg: $"no readiness adapter in ($root): expected .readiness/adapter.yaml \(or readiness/adapter.yaml in the canonical repository\)"}
   }
-  let a = (open --raw $p | from yaml)
-  if (($a | get -o adapter) != $ADAPTER_SCHEMA) { error make {msg: $"($p): adapter schema must be ($ADAPTER_SCHEMA)"} }
-  if (($a | get -o contract_version) not-in $SUPPORTED_RECORD_CONTRACTS) { error make {msg: $"($p): contract_version ($a | get -o contract_version) is not supported by this validator \(($CONTRACT)\)"} }
-  for key in ["repo" "path_classes" "control_points"] {
-    if (($a | get -o $key) == null) { error make {msg: $"($p): missing required key ($key)"} }
-  }
-  for pc in $a.path_classes {
-    if (($pc | get -o glob) == null or ($pc | get -o class) == null) { error make {msg: $"($p): every path_classes entry needs glob and class"} }
-    if ($pc.class not-in (class-names)) { error make {msg: $"($p): unknown class ($pc.class) in path_classes"} }
-    for e in ($pc | get -o extra_evidence | default []) {
-      if ($e not-in $EVIDENCE_KINDS) { error make {msg: $"($p): unknown extra_evidence kind ($e)"} }
-    }
-  }
-  for cp in $a.control_points {
-    for key in ["id" "kind" "path" "enforces"] {
-      if (($cp | get -o $key) == null) { error make {msg: $"($p): control point missing ($key)"} }
-    }
-  }
+  let a = (validate-adapter (open --raw $p | from yaml) $p)
   $a | insert _path $p | insert _dir ($p | path dirname)
+}
+
+def control-point-paths [adapter] {
+  $adapter.control_points | each {|cp| $cp | get -o path } | compact
 }
 
 def lock-path [dir] { [$dir "lock.yaml"] | path join }
@@ -367,6 +398,34 @@ def parse-evidence [comments] {
   } | flatten | compact
 }
 
+# The comment body an evidence record takes. Shared by `evidence` (a person or
+# a repository's own workflow) and the broker, so both produce byte-comparable
+# records with the same fingerprint.
+def evidence-body [repo: string, kind: string, status: string, sha: string, control_point: string, run, note] {
+  let fp = (evidence-fingerprint $repo $kind $sha $status)
+  ([
+    $"Readiness evidence for ($repo): **($kind)** = ($status) at `($sha)`."
+    ""
+    "```readiness-evidence"
+    $"contract: ($CONTRACT)"
+    $"repo: ($repo)"
+    $"kind: ($kind)"
+    $"status: ($status)"
+    $"ref: ($sha)"
+    $"control_point: ($control_point)"
+    $"run: ($run | default '')"
+    $"recorded_at: (fmt-ts (now-utc))"
+    $"fingerprint: ($fp)"
+  ] | append (if ($note == null) { [] } else { [$"note: ($note)"] }) | append ["```"] | str join "\n")
+}
+
+def load-registry [path: string] {
+  let reg = (open --raw $path | from yaml)
+  if (($reg | get -o registry) != $REGISTRY_SCHEMA) { error make {msg: $"($path): registry schema must be ($REGISTRY_SCHEMA)"} }
+  if (($reg | get -o repositories) == null) { error make {msg: $"($path): registry has no repositories"} }
+  $reg
+}
+
 def evidence-fingerprint [repo: string, kind: string, ref: string, status: string] {
   short-hash $"($repo)|($kind)|($ref)|($status)"
 }
@@ -447,7 +506,7 @@ def github-event [] {
 
 def verdict-status [findings] {
   if ($findings | is-empty) { return "ready" }
-  let order = ["unavailable" "missing" "invalid" "not-ready" "stale" "out-of-scope" "insufficient" "evidence-missing"]
+  let order = ["unavailable" "not-onboarded" "missing" "invalid" "not-ready" "stale" "out-of-scope" "insufficient" "evidence-missing"]
   $order | where {|s| $findings | any {|f| $f.code == $s } } | first
 }
 
@@ -475,12 +534,113 @@ def exit-with [v, json: bool] {
 }
 
 # ---------------------------------------------------------------------------
+# evaluation core
+# ---------------------------------------------------------------------------
+
+# The one place a verdict is decided. `check` gathers its context from a local
+# checkout, `broker` gathers the same context from the GitHub API; neither
+# holds policy of its own.
+#
+# ctx: {now, repo, adapter, issue_id, paths, description, unavailable,
+#       state_type, comments, require_evidence, ref, any_ref, actor}
+def evaluate-readiness [ctx] {
+  let adapter = $ctx.adapter
+  let repo_name = $ctx.repo
+  let now = $ctx.now
+  let issue_id = ($ctx | get -o issue_id)
+
+  let actor = ($ctx | get -o actor)
+  if ($actor != null) and ($actor in ($adapter | get -o exempt_actors | default [])) {
+    return (make-verdict "ready" [] {issue: $issue_id, repo: $repo_name, required_class: null, declared_class: null, exempt_actor: $actor, evidence_required: []})
+  }
+
+  # Changed paths decide the class. No path information at all fails closed to
+  # the strictest class the adapter declares.
+  let paths = ($ctx | get -o paths | default [])
+  let matched = if ($paths | is-empty) {
+    $adapter.path_classes
+  } else {
+    $paths | each {|p| $adapter.path_classes | where {|pc| glob-match $pc.glob $p } | get -o 0 } | compact
+  }
+  # A branch head has no "changed paths"; the broker asks instead whether a
+  # ready record covers this repository at the class the registry declares, so
+  # it passes that class in rather than letting the empty path list fail closed
+  # to the strictest one.
+  let forced = ($ctx | get -o force_class)
+  let required_class = if ($forced != null) { $forced } else { max-class ($matched | get class) }
+  let evidence_required = if ($forced != null) {
+    (class-row $required_class).evidence
+  } else {
+    ((class-row $required_class).evidence)
+    | append ($matched | each {|m| $m | get -o extra_evidence | default [] } | flatten)
+    | uniq
+  }
+  let base = {repo: $repo_name, required_class: $required_class, declared_class: null, evidence_required: $evidence_required, paths: $paths}
+
+  if ($issue_id == null) {
+    let prefix = ($adapter | get -o issue_prefix | default $DEFAULT_ISSUE_PREFIX)
+    return (make-verdict "missing" [(finding "missing" $"no ($prefix)-<n> issue reference in the PR title, branch, body, or head commit message")] ($base | merge {issue: null}))
+  }
+  let unavailable = ($ctx | get -o unavailable)
+  if ($unavailable != null) {
+    return (make-verdict "unavailable" [(finding "unavailable" $unavailable)] ($base | merge {issue: $issue_id}))
+  }
+
+  let description = ($ctx | get -o description | default "")
+  let blocks = (fenced-blocks $description "readiness")
+  if ($blocks | is-empty) {
+    return (make-verdict "missing" [(finding "missing" $"issue ($issue_id) has no ```readiness block; create it from `readiness.nu template`")] ($base | merge {issue: $issue_id}))
+  }
+  if ($blocks | length) > 1 {
+    return (make-verdict "invalid" [(finding "invalid" "issue has more than one readiness block")] ($base | merge {issue: $issue_id}))
+  }
+  let rec = (parse-yaml-block ($blocks | first))
+  if ($rec == null) {
+    return (make-verdict "invalid" [(finding "invalid" "readiness block is not a YAML mapping")] ($base | merge {issue: $issue_id}))
+  }
+  let shape = (validate-record-shape $rec)
+  if ($shape | is-not-empty) {
+    return (make-verdict "invalid" $shape ($base | merge {issue: $issue_id, declared_class: ($rec | get -o blast_radius)}))
+  }
+  if $rec.issue != $issue_id {
+    return (make-verdict "invalid" [(finding "invalid" $"record issue ($rec.issue) does not match the referenced issue ($issue_id)")] ($base | merge {issue: $issue_id, declared_class: $rec.blast_radius}))
+  }
+
+  let findings = (validate-record-semantics $rec {now: $now, description: $description, repo: $repo_name, required_class: $required_class, issue_state_type: ($ctx | get -o state_type)})
+  let waived = (active-waivers $rec $now)
+  let effective_required = ($evidence_required | where {|k| $k not-in $waived })
+  let ev_findings = if (($ctx | get -o require_evidence | default false)) and ($findings | is-empty) {
+    check-evidence (parse-evidence ($ctx | get -o comments | default [])) $repo_name $effective_required ($ctx | get -o ref) (($ctx | get -o any_ref | default false))
+  } else { [] }
+
+  let all = ($findings | append $ev_findings)
+  make-verdict (verdict-status $all) $all ($base | merge {
+    issue: $issue_id, declared_class: $rec.blast_radius, evidence_required: $effective_required,
+    waived: $waived, record: $rec
+  })
+}
+
+# Fetch the issue from Linear and shape it for evaluate-readiness. Never
+# throws: a failure becomes an `unavailable` context, which is fail-closed.
+def load-issue-context [issue_id: string] {
+  let r = (try { {ok: true, issue: (linear-issue $issue_id)} } catch {|e| {ok: false, msg: $e.msg} })
+  if not $r.ok { return {unavailable: $r.msg, description: "", state_type: null, comments: [], id: null} }
+  {
+    unavailable: null
+    description: ($r.issue | get -o description | default "")
+    state_type: ($r.issue | get -o state.type)
+    comments: ($r.issue | get -o comments.nodes | default [])
+    id: $r.issue.id
+  }
+}
+
+# ---------------------------------------------------------------------------
 # main commands
 # ---------------------------------------------------------------------------
 
 def main [] {
   print $"readiness.nu ($CONTRACT) — canonical readiness validator"
-  print "subcommands: check, parse, digest, stamp, template, evidence, comment, discover, audit, lock, version"
+  print "subcommands: check, broker, parse, digest, stamp, template, evidence, comment, issue, discover, audit, lock, version"
   print "run `nu readiness.nu <subcommand> --help` for flags"
 }
 
@@ -513,11 +673,6 @@ def "main check" [
   let repo_name = ($repo | default $adapter.repo)
   let prefix = ($adapter | get -o issue_prefix | default $DEFAULT_ISSUE_PREFIX)
 
-  if ($actor != null) and ($actor in ($adapter | get -o exempt_actors | default [])) {
-    let v = (make-verdict "ready" [] {issue: null, repo: $repo_name, required_class: null, declared_class: null, exempt_actor: $actor, evidence_required: []})
-    exit-with $v $json
-  }
-
   # 1. issue reference
   let event = (github-event)
   let pr = if ($event == null) { null } else { $event | get -o pull_request }
@@ -532,81 +687,30 @@ def "main check" [
     (if ($pr == null) { null } else { issue-ref-in ($pr | get -o body) $prefix })
     (issue-ref-in $head_msg $prefix)
   ] | compact
-  if ($sources | is-empty) {
-    let v = (make-verdict "missing" [(finding "missing" $"no ($prefix)-<n> issue reference in the PR title, branch, body, or head commit message")] {issue: null, repo: $repo_name, required_class: null, declared_class: null, evidence_required: []})
-    exit-with $v $json
-  }
-  let issue_id = ($sources | first)
+  let issue_id = ($sources | get -o 0)
 
-  # 2. changed paths → required class and evidence
+  # 2. changed paths
   let paths = if ($files != null) { $files | split row "," | each {|p| $p | str trim } | where {|p| $p | is-not-empty } } else if ($base != null) { changed-files $root $base $head } else if ($pr != null) {
     let base_sha = ($pr | get -o base.sha)
     let head_sha = ($pr | get -o head.sha)
     if ($base_sha == null or $head_sha == null) { [] } else { try { changed-files $root $base_sha $head_sha } catch { [] } }
   } else { [] }
-  let matched = if ($paths | is-empty) {
-    # nothing known about the change: fail closed to the strictest class the adapter declares
-    $adapter.path_classes
+
+  # 3. issue content: an offline --record, or Linear
+  let loaded = if ($issue_id == null) {
+    {description: "", state_type: null, comments: [], unavailable: null}
+  } else if ($record != null) {
+    {description: (open --raw $record), state_type: $issue_state, comments: (if ($comments == null) { [] } else { open --raw $comments | from json }), unavailable: null}
   } else {
-    $paths | each {|p| $adapter.path_classes | where {|pc| glob-match $pc.glob $p } | get -o 0 } | compact
-  }
-  let required_class = (max-class ($matched | get class))
-  let evidence_required = (
-    ((class-row $required_class).evidence)
-    | append ($matched | each {|m| $m | get -o extra_evidence | default [] } | flatten)
-    | uniq
-  )
-
-  # 3. issue content
-  let loaded = if ($record != null) {
-    {description: (open --raw $record), state_type: $issue_state, id: null, comments: (if ($comments == null) { [] } else { open --raw $comments | from json })}
-  } else {
-    let r = (try { {ok: true, issue: (linear-issue $issue_id)} } catch {|e| {ok: false, msg: $e.msg} })
-    if not $r.ok {
-      let v = (make-verdict "unavailable" [(finding "unavailable" $r.msg)] {issue: $issue_id, repo: $repo_name, required_class: $required_class, declared_class: null, evidence_required: $evidence_required})
-      exit-with $v $json
-    }
-    {description: ($r.issue | get -o description | default ""), state_type: ($r.issue | get -o state.type), id: $r.issue.id, comments: ($r.issue | get -o comments.nodes | default [])}
+    load-issue-context $issue_id
   }
 
-  # 4. record
-  let blocks = (fenced-blocks $loaded.description "readiness")
-  if ($blocks | is-empty) {
-    let v = (make-verdict "missing" [(finding "missing" $"issue ($issue_id) has no ```readiness block; create it from `readiness.nu template`")] {issue: $issue_id, repo: $repo_name, required_class: $required_class, declared_class: null, evidence_required: $evidence_required})
-    exit-with $v $json
-  }
-  if ($blocks | length) > 1 {
-    let v = (make-verdict "invalid" [(finding "invalid" "issue has more than one readiness block")] {issue: $issue_id, repo: $repo_name, required_class: $required_class, declared_class: null, evidence_required: $evidence_required})
-    exit-with $v $json
-  }
-  let rec = (parse-yaml-block ($blocks | first))
-  if ($rec == null) {
-    let v = (make-verdict "invalid" [(finding "invalid" "readiness block is not a YAML mapping")] {issue: $issue_id, repo: $repo_name, required_class: $required_class, declared_class: null, evidence_required: $evidence_required})
-    exit-with $v $json
-  }
-  let shape = (validate-record-shape $rec)
-  if ($shape | is-not-empty) {
-    let v = (make-verdict "invalid" $shape {issue: $issue_id, repo: $repo_name, required_class: $required_class, declared_class: ($rec | get -o blast_radius), evidence_required: $evidence_required})
-    exit-with $v $json
-  }
-  if $rec.issue != $issue_id {
-    let v = (make-verdict "invalid" [(finding "invalid" $"record issue ($rec.issue) does not match the referenced issue ($issue_id)")] {issue: $issue_id, repo: $repo_name, required_class: $required_class, declared_class: $rec.blast_radius, evidence_required: $evidence_required})
-    exit-with $v $json
-  }
-  let findings = (validate-record-semantics $rec {now: $now, description: $loaded.description, repo: $repo_name, required_class: $required_class, issue_state_type: $loaded.state_type})
-
-  # 5. evidence
-  let waived = (active-waivers $rec $now)
-  let effective_required = ($evidence_required | where {|k| $k not-in $waived })
-  let ev_findings = if $require_evidence and ($findings | is-empty) {
-    let ref_sha = if ($ref != null) { $ref } else { ^git -C $root rev-parse $head | complete | get stdout | str trim }
-    check-evidence (parse-evidence $loaded.comments) $repo_name $effective_required $ref_sha $any_ref
-  } else { [] }
-
-  let all = ($findings | append $ev_findings)
-  let v = (make-verdict (verdict-status $all) $all {
-    issue: $issue_id, repo: $repo_name, required_class: $required_class, declared_class: $rec.blast_radius,
-    evidence_required: $effective_required, waived: $waived, record: $rec, paths: $paths
+  let ref_sha = if ($ref != null) { $ref } else { ^git -C $root rev-parse $head | complete | get stdout | str trim }
+  let v = (evaluate-readiness {
+    now: $now, repo: $repo_name, adapter: $adapter, issue_id: $issue_id, paths: $paths,
+    description: $loaded.description, unavailable: ($loaded | get -o unavailable),
+    state_type: ($loaded | get -o state_type), comments: $loaded.comments,
+    require_evidence: $require_evidence, ref: $ref_sha, any_ref: $any_ref, actor: $actor
   })
   exit-with $v $json
 }
@@ -730,20 +834,7 @@ def "main evidence" [
   let repo_name = ($repo | default (load-adapter $root).repo)
   let sha = if ($ref != null) { $ref } else { ^git -C $root rev-parse HEAD | complete | get stdout | str trim }
   let fp = (evidence-fingerprint $repo_name $kind $sha $status)
-  let body = ([
-    $"Readiness evidence for ($repo_name): **($kind)** = ($status) at `($sha)`."
-    ""
-    "```readiness-evidence"
-    $"contract: ($CONTRACT)"
-    $"repo: ($repo_name)"
-    $"kind: ($kind)"
-    $"status: ($status)"
-    $"ref: ($sha)"
-    $"control_point: ($control_point)"
-    $"run: ($run | default '')"
-    $"recorded_at: (fmt-ts (now-utc))"
-    $"fingerprint: ($fp)"
-  ] | append (if ($note == null) { [] } else { [$"note: ($note)"] }) | append ["```"] | str join "\n")
+  let body = (evidence-body $repo_name $kind $status $sha $control_point $run $note)
   if $dry_run { print $body; return }
   let i = (linear-issue $issue)
   let existing = (parse-evidence ($i | get -o comments.nodes | default []) | where fingerprint == $fp)
@@ -777,13 +868,13 @@ def discover-paths [root] {
 
 def discover-report [root, adapter] {
   let found = (discover-paths $root)
-  let registered = ($adapter.control_points | get path)
+  let registered = (control-point-paths $adapter)
   let ignored = ($adapter | get -o ignore_paths | default [])
   let rows = ($found | each {|d|
     let status = if ($d.path in $registered) { "registered" } else if ($ignored | any {|g| glob-match $g $d.path }) { "ignored" } else { "unregistered" }
     $d | insert status $status
   })
-  let missing_cp = ($adapter.control_points | where {|cp| not ([$root $cp.path] | path join | path exists) })
+  let missing_cp = ($adapter.control_points | where {|cp| ($cp | get -o path) != null } | where {|cp| not ([$root $cp.path] | path join | path exists) })
   {paths: $rows, unregistered: ($rows | where status == "unregistered"), missing_control_points: $missing_cp}
 }
 
@@ -867,7 +958,28 @@ def audit-repo [entry, root_dir, canonical_sha: string, github: bool, token: str
   let rep = (discover-report $root $a)
   for m in $rep.missing_control_points { $gaps = ($gaps | append $"control point ($m.id) path ($m.path) does not exist") }
   for cp in ($a.control_points | where enforces == true) {
-    if not (gate-marker-ok $root $cp) { $gaps = ($gaps | append $"enforcing control point ($cp.id) \(($cp.path)\) does not invoke the readiness gate") }
+    if $cp.kind == $BROKER_KIND {
+      # Enforced from the canonical repository: the broker posts this status
+      # and branch protection requires it. What the audit can check here is
+      # that the repository asks for the context the broker actually posts and
+      # that the registry expects it as a required check.
+      if $cp.required_check != $BROKER_CONTEXT {
+        $gaps = ($gaps | append $"control point ($cp.id) expects the status `($cp.required_check)`, but the broker posts `($BROKER_CONTEXT)`")
+      }
+      if ($cp.required_check not-in ($entry | get -o required_checks | default [])) {
+        $gaps = ($gaps | append $"registry entry does not list `($cp.required_check)` among required_checks")
+      }
+    } else if not (gate-marker-ok $root $cp) {
+      $gaps = ($gaps | append $"enforcing control point ($cp.id) \(($cp.path)\) does not invoke the readiness gate")
+    }
+  }
+  # Every consuming repository must be enforced by the broker; a repository
+  # whose only enforcement is a local workflow would need its own Linear
+  # credential, which is the arrangement the broker replaced.
+  if not $is_canonical {
+    if (($a.control_points | where {|cp| ($cp.kind == $BROKER_KIND) and ($cp.enforces == true) } | is-empty)) {
+      $gaps = ($gaps | append $"no enforcing ($BROKER_KIND) control point: this repository is not gated by the canonical broker")
+    }
   }
   for u in $rep.unregistered { $gaps = ($gaps | append $"unregistered execution path: ($u.kind) ($u.path)") }
   let enforcing = ($a.control_points | where enforces == true)
@@ -891,10 +1003,57 @@ def audit-repo [entry, root_dir, canonical_sha: string, github: bool, token: str
   {
     repo: $entry.repo, located: true, head: $head, adapter_ok: true, lock_ok: $lock_ok, canonical_ok: $canonical_ok,
     class: ($entry | get -o class), contract: $a.contract_version,
-    control_points: ($a.control_points | each {|cp| {id: $cp.id, enforces: $cp.enforces, path: $cp.path} }),
+    control_points: ($a.control_points | each {|cp| {id: $cp.id, kind: $cp.kind, enforces: $cp.enforces, path: ($cp | get -o path)} }),
     missing_control_points: ($rep.missing_control_points | get id), unregistered: ($rep.unregistered | get path),
     exempt_actors: ($a | get -o exempt_actors | default []), protection: $protection, gaps: $gaps
   }
+}
+
+# The broker is the single enforcement point, so its health is part of
+# coverage: a broker that stopped running leaves every pull request without a
+# status, which blocks merges (fail-closed) but must never go unnoticed.
+def audit-broker [reg, canonical_entry, root_dir, github: bool] {
+  let dir = (locate-repo $root_dir $canonical_entry)
+  let workflow = if ($dir == null) { null } else { [$dir ".github" "workflows" $BROKER_WORKFLOW] | path join }
+  let present = ($workflow != null) and ($workflow | path exists)
+  let max_age = ($reg | get -o broker_max_age_minutes | default $BROKER_MAX_AGE_MINUTES)
+  let base_gaps = if $present { [] } else { [$"the canonical repository has no .github/workflows/($BROKER_WORKFLOW)"] }
+  let freshness = if not $github {
+    {last: null, age: null, gaps: []}
+  } else {
+    let r = (gh-get $"/repos/($canonical_entry.repo)/actions/workflows/($BROKER_WORKFLOW)/runs?status=success&per_page=1")
+    if $r.status != 200 {
+      {last: null, age: null, gaps: [$"cannot read broker workflow runs \(HTTP ($r.status)\)"]}
+    } else {
+      let run = ($r.body | get -o workflow_runs | default [] | get -o 0)
+      if ($run == null) {
+        {last: null, age: null, gaps: ["the broker workflow has never completed successfully"]}
+      } else {
+        let last = ($run | get -o updated_at)
+        let t = (parse-ts $last)
+        if ($t == null) {
+          {last: $last, age: null, gaps: [$"the last successful broker run has an unreadable timestamp \(($last)\)"]}
+        } else {
+          let age = (((now-utc) - $t) / 1min | math round)
+          {last: $last, age: $age, gaps: (if $age > $max_age { [$"the last successful broker run is ($age) minutes old \(limit ($max_age)\); pull requests are unattended"] } else { [] })}
+        }
+      }
+    }
+  }
+  {
+    workflow: $BROKER_WORKFLOW, present: $present, context: $BROKER_CONTEXT,
+    last_success: $freshness.last, age_minutes: $freshness.age, max_age_minutes: $max_age,
+    checked: $github, gaps: ($base_gaps | append $freshness.gaps)
+  }
+}
+
+def broker-markdown [b] {
+  let freshness = if $b.checked {
+    $"last success ($b.last_success | default 'never') \(($b.age_minutes | default '?') min, limit ($b.max_age_minutes) min\)"
+  } else {
+    "freshness not checked (no --github)"
+  }
+  $"**Broker**: `($b.workflow)` present ($b.present), posts `($b.context)`; ($freshness)."
 }
 
 def audit-markdown [report] {
@@ -912,7 +1071,7 @@ def audit-markdown [report] {
     ""
     "| repository | head | class | contract | status | gaps |"
     "|---|---|---|---|---|---|"
-  ] | append $rows | append [""] | append $details | append [
+  ] | append $rows | append [""] | append [(broker-markdown $report.broker)] | append ($report.broker.gaps | each {|g| $"- ($g)" }) | append [""] | append $details | append [
     ""
     $"Total gaps: ($report.total_gaps). Repositories covered: ($report.covered)/($report.repositories | length)."
   ]) | str join "\n"
@@ -922,25 +1081,25 @@ def audit-markdown [report] {
 def "main audit" [
   --registry: path         # registry.yaml (default: next to this validator)
   --root: path             # directory holding the clones (flat <name>/ or ghq github.com/<owner>/<name>/ layout)
-  --github                 # also verify branch protection and required checks through the GitHub API (needs GITHUB_TOKEN or READINESS_AUDIT_TOKEN)
+  --github                 # also verify branch protection and required checks through the GitHub API (needs GITHUB_TOKEN or READINESS_GITHUB_TOKEN)
   --json                   # machine-readable report
   --out: path              # write the markdown report here
   --post-issue: string     # post the markdown report as a Linear comment on this issue
 ] {
   let reg_path = ($registry | default ([($SELF | path dirname) "registry.yaml"] | path join))
-  let reg = (open --raw $reg_path | from yaml)
-  if (($reg | get -o registry) != $REGISTRY_SCHEMA) { error make {msg: $"($reg_path): registry schema must be ($REGISTRY_SCHEMA)"} }
+  let reg = (load-registry $reg_path)
   let root_dir = ($root | default ($SELF | path dirname | path dirname | path dirname))
   let canonical_entry = ($reg.repositories | where {|r| ($r | get -o canonical | default false) == true } | get -o 0)
   if ($canonical_entry == null) { error make {msg: "registry has no canonical repository entry"} }
   let canonical_sha = (validator-sha $SELF)
-  let token = ($env | get -o READINESS_AUDIT_TOKEN | default ($env | get -o GITHUB_TOKEN | default ""))
-  if $github and ($token | is-empty) { error make {msg: "--github needs READINESS_AUDIT_TOKEN or GITHUB_TOKEN"} }
+  let token = ($env | get -o READINESS_GITHUB_TOKEN | default ($env | get -o GITHUB_TOKEN | default ""))
+  if $github and ($token | is-empty) { error make {msg: "--github needs READINESS_GITHUB_TOKEN or GITHUB_TOKEN"} }
   let repos = ($reg.repositories | each {|e| audit-repo ($e | upsert contract_version ($e | get -o contract_version | default $reg.contract_version)) $root_dir $canonical_sha $github $token })
-  let total = ($repos | each {|r| $r.gaps | length } | math sum)
+  let broker = (audit-broker $reg $canonical_entry $root_dir $github)
+  let total = (($repos | each {|r| $r.gaps | length } | math sum) + ($broker.gaps | length))
   let report = {
     contract: $CONTRACT, registry: ($reg_path | path basename), generated_at: (fmt-ts (now-utc)), canonical_sha256: $canonical_sha,
-    github_checked: $github, repositories: $repos, total_gaps: $total, covered: ($repos | where {|r| $r.gaps | is-empty } | length)
+    github_checked: $github, repositories: $repos, broker: $broker, total_gaps: $total, covered: ($repos | where {|r| $r.gaps | is-empty } | length)
   }
   let md = (audit-markdown $report)
   if ($out != null) { $md | save --force $out }
@@ -1021,4 +1180,385 @@ def "main issue" [--title: string, --branch: string, --body: string, --repo-dir:
   ] | compact
   if ($sources | is-empty) { print -e $"no ($prefix)-<n> issue reference found"; exit 1 }
   print ($sources | first)
+}
+
+# ---------------------------------------------------------------------------
+# GitHub API (broker and audit)
+# ---------------------------------------------------------------------------
+
+def github-token [] {
+  let t = ($env | get -o READINESS_GITHUB_TOKEN | default ($env | get -o GITHUB_TOKEN | default ""))
+  if ($t | str trim | is-empty) {
+    error make {msg: "no GitHub token: set READINESS_GITHUB_TOKEN (the broker credential) or GITHUB_TOKEN"}
+  }
+  $t
+}
+
+def gh-headers [accept: string] {
+  let tok = (github-token)
+  ["Authorization" $"Bearer ($tok)" "Accept" $accept "X-GitHub-Api-Version" "2022-11-28" "User-Agent" "readiness-broker"]
+}
+
+def gh-get [path: string, --accept: string = "application/vnd.github+json"] {
+  let r = (http get --full --allow-errors --headers (gh-headers $accept) $"($GITHUB_API)($path)")
+  {status: $r.status, body: $r.body}
+}
+
+def gh-post [path: string, payload] {
+  let r = (http post --full --allow-errors --content-type application/json --headers (gh-headers "application/vnd.github+json") $"($GITHUB_API)($path)" ($payload | to json))
+  {status: $r.status, body: $r.body}
+}
+
+# ---------------------------------------------------------------------------
+# broker — the enforcement point for every consuming repository
+# ---------------------------------------------------------------------------
+#
+# Consuming repositories hold no Linear credential. This command runs in the
+# canonical repository, evaluates every open pull request in the registry
+# against its Linear record, and posts the `Readiness Gate` commit status that
+# their branch protection requires. A status that is absent (the broker has
+# not seen a push yet) blocks the merge exactly like a failing one, so the
+# default is closed.
+
+def broker-status-state [status: string] {
+  if $status == "ready" { "success" } else if $status == "unavailable" { "error" } else { "failure" }
+}
+
+# A base branch with no adapter is a repository that carries no readiness
+# policy there yet. That blocks its pull requests — fail-closed — but it is a
+# verdict about the change, not a fault in the broker, so it must not make the
+# run fail and the freshness check go stale.
+def broker-not-onboarded [repo: string, msg: string] {
+  make-verdict "not-onboarded" [(finding "not-onboarded" $msg)] {
+    issue: null, repo: $repo, required_class: null, declared_class: null, evidence_required: [], paths: []
+  }
+}
+
+def broker-description [v] {
+  let first = ($v.findings | get -o 0.message | default $"record ready for ($v.required_class | default 'this change')")
+  let text = $"($v.status): ($first)"
+  # GitHub rejects a status description over 140 characters.
+  if ($text | str length) > 138 { ($text | str substring 0..<137) + "…" } else { $text }
+}
+
+# The adapter is read from the pull request's BASE ref, never its head. The
+# head is author-controlled: an adapter fetched from it could reclassify the
+# change as `local` or add its own author to exempt_actors. A pull request that
+# edits the adapter is judged by the adapter already on the base branch, which
+# is what review is for.
+def broker-adapter [repo: string, ref: string] {
+  # Same two locations as a local checkout: .readiness/ everywhere, and
+  # readiness/ in the canonical repository, which owns the contract itself.
+  let candidates = [".readiness/adapter.yaml" "readiness/adapter.yaml"]
+  let found = ($candidates | each {|path|
+    let r = (gh-get $"/repos/($repo)/contents/($path)?ref=($ref)" --accept "application/vnd.github.raw")
+    if $r.status == 200 { {path: $path, body: $r.body} } else { null }
+  } | compact | get -o 0)
+  if ($found == null) {
+    return {ok: false, msg: $"no readable adapter on ($repo)@($ref): tried ($candidates | str join ', ')"}
+  }
+  let parsed = (try { validate-adapter ($found.body | from yaml) $"($repo)@($ref):($found.path)" } catch {|e| {__err: $e.msg} })
+  if (($parsed | get -o __err) != null) { return {ok: false, msg: $"adapter on ($repo)@($ref) is invalid: ($parsed.__err)"} }
+  {ok: true, adapter: $parsed}
+}
+
+# Changed paths of a pull request. GitHub truncates this listing at 3000
+# files; a truncated answer returns an empty list, which makes
+# evaluate-readiness fall back to the strictest class the adapter declares.
+def broker-pr-files [repo: string, number: int] {
+  mut all = []
+  mut page = 1
+  mut truncated = false
+  loop {
+    let r = (gh-get $"/repos/($repo)/pulls/($number)/files?per_page=100&page=($page)")
+    if $r.status != 200 { return {ok: false, msg: $"cannot list files of ($repo)#($number) \(HTTP ($r.status)\)", files: []} }
+    let batch = ($r.body | each {|f| $f.filename })
+    $all = ($all | append $batch)
+    if (($batch | length) < 100) { break }
+    if $page >= 30 { $truncated = true; break }
+    $page = $page + 1
+  }
+  if $truncated { {ok: true, files: [], truncated: true} } else { {ok: true, files: $all, truncated: false} }
+}
+
+# Check runs and commit statuses on a sha, flattened to {name, ok} plus the
+# raw statuses so an unchanged readiness status is not reposted every tick.
+def broker-signals [repo: string, sha: string] {
+  let cr = (gh-get $"/repos/($repo)/commits/($sha)/check-runs?per_page=100")
+  let runs = if $cr.status == 200 {
+    $cr.body | get -o check_runs | default [] | each {|c| {name: $c.name, ok: ((($c | get -o conclusion) | default "") == "success")} }
+  } else { [] }
+  let st = (gh-get $"/repos/($repo)/commits/($sha)/status")
+  let statuses = if $st.status == 200 { $st.body | get -o statuses | default [] } else { [] }
+  let from_status = ($statuses | each {|s| {name: $s.context, ok: ($s.state == "success")} })
+  {checks: ($runs | append $from_status), statuses: $statuses}
+}
+
+# Read the commit's signals, then post the verdict unless it is already the
+# status standing on that commit.
+def broker-post-row [repo: string, target, v, dry_run: bool] {
+  let signals = (broker-signals $repo $target.sha)
+  let existing = ($signals.statuses | where {|s| ($s | get -o context) == $BROKER_CONTEXT } | get -o 0)
+  let posted = (broker-post-status $repo $target.sha $v $target.url $existing $dry_run)
+  {signals: $signals, posted: $posted}
+}
+
+def broker-row [repo: string, target, v, posted, evidence] {
+  {
+    repo: $repo, kind: $target.kind, ref: ($target | get -o number | default $target.branch), sha: ($target.sha | str substring 0..<8),
+    url: $target.url, issue: ($v | get -o issue), status: $v.status, state: $posted.state, action: $posted.action,
+    required_class: ($v | get -o required_class), findings: ($v.findings | each {|f| $f.message }), evidence: $evidence
+  }
+}
+
+def broker-post-status [repo: string, sha: string, v, target: string, existing, dry_run: bool] {
+  let state = (broker-status-state $v.status)
+  let desc = (broker-description $v)
+  if ($existing != null) and ((($existing | get -o state) == $state) and (($existing | get -o description) == $desc)) {
+    return {state: $state, action: "unchanged"}
+  }
+  if $dry_run { return {state: $state, action: "dry-run"} }
+  let r = (gh-post $"/repos/($repo)/statuses/($sha)" {state: $state, context: $BROKER_CONTEXT, description: $desc, target_url: $target})
+  if $r.status >= 300 { error make {msg: $"cannot post the readiness status to ($repo)@($sha): HTTP ($r.status)"} }
+  {state: $state, action: "posted"}
+}
+
+# Evidence the repository's own checks have already proven. A control point
+# that declares `evidence` and the `check_name` producing it gets those kinds
+# recorded on the issue once that check is green on this exact sha.
+def broker-record-evidence [repo: string, adapter, issue_uuid, sha: string, checks, comments, run_url: string, dry_run: bool] {
+  if ($issue_uuid == null) { return [] }
+  let existing = (parse-evidence $comments)
+  let producers = ($adapter.control_points | where {|cp|
+    ((($cp | get -o evidence | default []) | is-not-empty)) and ((($cp | get -o check_name) | default "") != "")
+  })
+  $producers | each {|cp|
+    let hit = ($checks | where {|c| $c.name == $cp.check_name } | get -o 0)
+    if ($hit == null) or (not $hit.ok) { [] } else {
+      $cp.evidence | each {|kind|
+        let fp = (evidence-fingerprint $repo $kind $sha "pass")
+        if ($existing | any {|e| ($e | get -o fingerprint) == $fp }) { null } else {
+          if $dry_run { {kind: $kind, control_point: $cp.id, action: "dry-run"} } else {
+            linear-comment-create $issue_uuid (evidence-body $repo $kind "pass" $sha $cp.id $run_url $"($cp.check_name) succeeded on this commit")
+            {kind: $kind, control_point: $cp.id, action: "recorded"}
+          }
+        }
+      } | compact
+    }
+  } | flatten
+}
+
+def broker-issue-ref [adapter, title, branch, body] {
+  let prefix = ($adapter | get -o issue_prefix | default $DEFAULT_ISSUE_PREFIX)
+  [
+    (issue-ref-in $title $prefix)
+    (issue-ref-in $branch $prefix)
+    (issue-ref-in $body $prefix)
+  ] | compact | get -o 0
+}
+
+def broker-evaluate-target [entry, target, adapter, now, run_url: string, dry_run: bool] {
+  # target: {kind: "pull-request"|"branch", sha, base_ref, number, title, branch, body, actor, url, force_class}
+  let repo = $entry.repo
+  if $adapter.repo != $repo {
+    error make {msg: $"adapter on ($repo)@($target.base_ref) declares repo ($adapter.repo)"}
+  }
+  let paths = if $target.kind == "pull-request" {
+    let f = (broker-pr-files $repo $target.number)
+    if not $f.ok { error make {msg: $f.msg} }
+    $f.files
+  } else { [] }
+  let issue_id = (broker-issue-ref $adapter ($target | get -o title) ($target | get -o branch) ($target | get -o body))
+  let issue = if ($issue_id == null) { {description: "", state_type: null, comments: [], unavailable: null, id: null} } else { load-issue-context $issue_id }
+  let require_evidence = (($entry | get -o require_evidence | default false) == true)
+  let v = (evaluate-readiness {
+    now: $now, repo: $repo, adapter: $adapter, issue_id: $issue_id, paths: $paths,
+    description: $issue.description, unavailable: ($issue | get -o unavailable),
+    state_type: ($issue | get -o state_type), comments: $issue.comments,
+    require_evidence: $require_evidence, ref: $target.sha, any_ref: false,
+    actor: ($target | get -o actor), force_class: ($target | get -o force_class)
+  })
+  let out = (broker-post-row $repo $target $v $dry_run)
+  let evidence = (try {
+    broker-record-evidence $repo $adapter ($issue | get -o id) $target.sha $out.signals.checks $issue.comments $run_url $dry_run
+  } catch {|e| [{action: "failed", error: $e.msg}] })
+  broker-row $repo $target $v $out.posted $evidence
+}
+
+def broker-open-prs [repo: string, number] {
+  if ($number != null) {
+    let r = (gh-get $"/repos/($repo)/pulls/($number)")
+    if $r.status != 200 { error make {msg: $"cannot read ($repo)#($number) \(HTTP ($r.status)\)"} }
+    [$r.body]
+  } else {
+    let r = (gh-get $"/repos/($repo)/pulls?state=open&per_page=100")
+    if $r.status != 200 { error make {msg: $"cannot list open pull requests of ($repo) \(HTTP ($r.status)\)"} }
+    $r.body
+  }
+}
+
+# Evaluate open pull requests (and, where the registry asks for it, the
+# default-branch head) and post the readiness status GitHub branch protection
+# requires. Exits non-zero only on an operational failure: a pull request that
+# is not ready is a posted verdict, not a broker error.
+def "main broker" [
+  --registry: path         # registry.yaml (default: next to this validator)
+  --repo: string           # limit to one registered repository
+  --pr: int                # limit to one pull request (requires --repo)
+  --run-url: string = ""   # URL of the broker run, recorded on evidence comments
+  --dry-run                # evaluate and report; post nothing
+  --now: string            # override current time (tests)
+  --json
+] {
+  let now = if ($now == null) { now-utc } else { let t = (parse-ts $now); if ($t == null) { error make {msg: "--now must be RFC 3339"} }; $t }
+  let reg = (load-registry ($registry | default ([($SELF | path dirname) "registry.yaml"] | path join)))
+  let entries = ($reg.repositories | where {|r| ($repo == null) or ($r.repo == $repo) })
+  if ($entries | is-empty) { error make {msg: $"no registry entry for ($repo | default '<all>')"} }
+  if ($pr != null) and ($repo == null) { error make {msg: "--pr requires --repo"} }
+
+  mut rows = []
+  mut errors = []
+  for e in $entries {
+    let prs = (try { {ok: true, list: (broker-open-prs $e.repo $pr)} } catch {|err| {ok: false, msg: $err.msg} })
+    if not $prs.ok {
+      $errors = ($errors | append {repo: $e.repo, error: $prs.msg})
+      continue
+    }
+    # Pull requests share base branches, and the adapter is read from the
+    # base; fetch it once per base ref instead of once per pull request.
+    let base_refs = ($prs.list | each {|p| $p.base.ref } | uniq)
+    let adapters = ($base_refs | each {|ref| {ref: $ref, loaded: (broker-adapter $e.repo $ref)} })
+    for p in $prs.list {
+      let loaded = ($adapters | where ref == $p.base.ref | get 0.loaded)
+      let target = {
+        kind: "pull-request", sha: $p.head.sha, base_ref: $p.base.ref, number: $p.number,
+        title: ($p | get -o title), branch: ($p | get -o head.ref), body: ($p | get -o body),
+        actor: ($p | get -o user.login), url: ($p | get -o html_url), force_class: null
+      }
+      let r = (try {
+        if $loaded.ok {
+          {ok: true, row: (broker-evaluate-target $e $target $loaded.adapter $now $run_url $dry_run)}
+        } else {
+          let v = (broker-not-onboarded $e.repo $loaded.msg)
+          {ok: true, row: (broker-row $e.repo $target $v (broker-post-row $e.repo $target $v $dry_run).posted [])}
+        }
+      } catch {|err| {ok: false, msg: $err.msg} })
+      if $r.ok { $rows = ($rows | append $r.row) } else { $errors = ($errors | append {repo: $e.repo, pr: $p.number, error: $r.msg}) }
+    }
+    # Release-class repositories also carry the status on their default-branch
+    # head, so a tag or dispatch build can require it with nothing but the
+    # workflow token.
+    if (($e | get -o gate_default_branch | default false) == true) and ($pr == null) {
+      let branch = ($e | get -o default_branch | default "main")
+      let hr = (gh-get $"/repos/($e.repo)/commits/($branch)")
+      if $hr.status != 200 {
+        $errors = ($errors | append {repo: $e.repo, error: $"cannot read ($branch) head \(HTTP ($hr.status)\)"})
+      } else {
+        let target = {
+          kind: "branch", sha: $hr.body.sha, base_ref: $branch, number: null,
+          title: null, branch: $branch, body: ($e | get -o release_issue),
+          actor: null, url: $"https://github.com/($e.repo)/commits/($branch)",
+          force_class: ($e | get -o class)
+        }
+        let loaded = (broker-adapter $e.repo $branch)
+        if not $loaded.ok {
+          # A default branch with no adapter is an onboarding gap the audit
+          # reports; do not paint a status on a branch head over it.
+          $rows = ($rows | append {
+            repo: $e.repo, kind: "branch", ref: $branch, sha: (($hr.body.sha) | str substring 0..<8), url: $target.url,
+            issue: null, status: "not-onboarded", state: "skipped", action: "skipped",
+            required_class: null, findings: [$loaded.msg], evidence: []
+          })
+        } else {
+          let r = (try { {ok: true, row: (broker-evaluate-target $e $target $loaded.adapter $now $run_url $dry_run)} } catch {|err| {ok: false, msg: $err.msg} })
+          if $r.ok { $rows = ($rows | append $r.row) } else { $errors = ($errors | append {repo: $e.repo, branch: $branch, error: $r.msg}) }
+        }
+      }
+    }
+  }
+
+  # A verdict of `unavailable` means Linear could not be read. The status is
+  # posted (fail-closed for the pull request), and the run fails so the audit's
+  # freshness check sees a stale broker instead of a silent one.
+  let unavailable = ($rows | where status == "unavailable")
+  let not_onboarded = ($rows | where status == "not-onboarded")
+  let report = {
+    contract: $CONTRACT, ran_at: (fmt-ts $now), dry_run: $dry_run,
+    evaluated: ($rows | length), ready: ($rows | where status == "ready" | length),
+    blocked: ($rows | where {|r| $r.status != "ready" } | length),
+    unavailable: ($unavailable | length), not_onboarded: ($not_onboarded | length),
+    targets: $rows, errors: $errors
+  }
+  if $json { print ($report | to json) } else {
+    print $"readiness broker ($CONTRACT): evaluated ($report.evaluated), ready ($report.ready), blocked ($report.blocked)"
+    for r in $rows {
+      print $"  [($r.state)] ($r.repo) ($r.kind) ($r.ref) ($r.sha) issue=($r.issue | default '-') ($r.status) \(($r.action)\)"
+      for f in $r.findings { print $"      ($f)" }
+      for ev in $r.evidence { print $"      evidence ($ev | get -o kind | default '?') ($ev.action)" }
+    }
+    for e in $errors { print $"  [error] ($e | to json --raw)" }
+  }
+  if ($errors | is-not-empty) or (($unavailable | length) > 0) { exit 1 }
+}
+
+# Assert that the broker's status is green on a commit, using nothing but a
+# GitHub token. This is how a consuming repository proves the readiness record
+# was validated without ever holding a Linear credential: the broker writes the
+# verdict as a commit status, and release or deploy paths read it back here.
+def "main assert-status" [
+  --repo: string           # owner/name (default: the adapter's repo)
+  --sha: string            # commit (default: HEAD of --repo-dir)
+  --context: string        # status context (default: the broker's)
+  --repo-dir: path
+  --json
+] {
+  let root = (git-root ($repo_dir | default (pwd)))
+  let repo_name = ($repo | default (load-adapter $root).repo)
+  let commit = if ($sha != null) { $sha } else { ^git -C $root rev-parse HEAD | complete | get stdout | str trim }
+  let ctx = ($context | default $BROKER_CONTEXT)
+  let r = (gh-get $"/repos/($repo_name)/commits/($commit)/status")
+  if $r.status != 200 {
+    let out = {ok: false, repo: $repo_name, sha: $commit, context: $ctx, state: null, reason: $"cannot read commit status \(HTTP ($r.status)\)"}
+    if $json { print ($out | to json) } else { print -e $"assert-status: ($out.reason)" }
+    exit 1
+  }
+  let hit = ($r.body | get -o statuses | default [] | where {|s| ($s | get -o context) == $ctx } | get -o 0)
+  let state = ($hit | get -o state)
+  let ok = ($state == "success")
+  let reason = if $ok { "" } else if ($hit == null) {
+    $"no `($ctx)` status on ($repo_name)@($commit); the broker has not evaluated this commit yet"
+  } else {
+    $"`($ctx)` is ($state) on ($repo_name)@($commit): ($hit | get -o description | default '')"
+  }
+  let out = {ok: $ok, repo: $repo_name, sha: $commit, context: $ctx, state: $state, reason: $reason, url: ($hit | get -o target_url)}
+  if $json { print ($out | to json) } else if $ok {
+    print $"assert-status: `($ctx)` is success on ($repo_name)@($commit | str substring 0..<8)"
+  } else {
+    print -e $"assert-status: ($reason)"
+  }
+  if $ok { exit 0 } else { exit 1 }
+}
+
+# Publish a fact this repository proved as a commit status. The broker turns
+# such a status into Linear evidence when the adapter names it as the
+# `check_name` of an evidence-producing control point, which is how a
+# repository contributes evidence without holding a Linear credential.
+def "main publish-status" [
+  --context: string        # status context, e.g. "z3store/verify-release"
+  --state: string = "success"  # success | failure | error | pending
+  --description: string = ""
+  --url: string = ""
+  --sha: string
+  --repo: string
+  --repo-dir: path
+] {
+  if ($context == null) { error make {msg: "--context is required"} }
+  if ($state not-in ["success" "failure" "error" "pending"]) { error make {msg: $"--state must be success, failure, error or pending"} }
+  let root = (git-root ($repo_dir | default (pwd)))
+  let repo_name = ($repo | default (load-adapter $root).repo)
+  let commit = if ($sha != null) { $sha } else { ^git -C $root rev-parse HEAD | complete | get stdout | str trim }
+  let desc = if (($description | str length) > 138) { ($description | str substring 0..<137) + "…" } else { $description }
+  let r = (gh-post $"/repos/($repo_name)/statuses/($commit)" {state: $state, context: $context, description: $desc, target_url: $url})
+  if $r.status >= 300 { error make {msg: $"cannot publish `($context)` to ($repo_name)@($commit): HTTP ($r.status)"} }
+  print $"published `($context)` = ($state) on ($repo_name)@($commit | str substring 0..<8)"
 }

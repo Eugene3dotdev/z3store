@@ -21,7 +21,7 @@
 import { rm } from "node:fs/promises";
 import { relative, resolve } from "node:path";
 import { appendJsonl, repoRoot, spawnSync, tail } from "./lib/runtime.ts";
-import { runReadinessCheck } from "./lib/readiness.ts";
+import { readinessMode, runReadinessCheck } from "./lib/readiness.ts";
 import {
 	runFuzz,
 	zig,
@@ -272,7 +272,7 @@ async function main(): Promise<void> {
 	const startedAt = Date.now();
 	const root = repoRoot();
 
-	console.log("== readiness gate (readiness/v1, release evidence) ==");
+	console.log(`== readiness gate (readiness/v1, ${readinessMode()}) ==`);
 	const readiness = runReadinessCheck({ tier: TIER, requireEvidence: true });
 	process.stdout.write(readiness.stdout);
 	process.stderr.write(readiness.stderr);

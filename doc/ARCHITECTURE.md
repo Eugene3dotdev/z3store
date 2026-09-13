@@ -40,7 +40,7 @@ orchestration logic lives in TypeScript.
 - **Zig resolution:** `mise x zig@0.16.0 -- zig`. Bare `zig` on PATH
   is diagnostic only (see `doc/adr/0002-zig-0.16-pinning.md`).
 - **VCS:** `jj git init --colocate`. The `git` surface exists for
-  Forgejo CI; `jj` is the operator-facing VCS.
+  GitHub Actions CI; `jj` is the operator-facing VCS.
 - **Node manager:** `mise` for non-JS runtimes; `vp` for the
   Node/TypeScript toolchain; `bunx` for JS/TS packages.
 - **Package managers:** `pixi` for Python (if ever needed), `bun`
@@ -136,7 +136,7 @@ This policy is repeated in:
 - root `CLAUDE.md` context
 - every primary and adjunct skill body
 - every subagent body
-- the review-prompt fallback `.forgejo/prompts/review.md`
+- the review-prompt fallback `.github/prompts/review.md`
 
 The boundary is a policy rule, not decorative prose. The v0 hook layer
 enforces it with a warn-only regex log inside `pretooluse-bash-guard.ts`.
@@ -145,19 +145,26 @@ tracked as an open question.
 
 ## 7. CI projection
 
-Two Forgejo workflows ship in v0, plus a release skeleton:
+Two GitHub Actions workflows ship, plus a release verification workflow. (v0 targeted
+Forgejo Actions; the estate consolidated on GitHub Actions, and the readiness
+broker in `EugOT/dotfiles` is what enforces the change-readiness record here.)
 
-- `.forgejo/workflows/verify-pr.yaml` — `zig-gate` job runs the
-  per-PR tier; `evals` job runs `bun scripts/eval.ts --check`. Both use
-  `mise` for Zig and a `curl` installer for Bun. A concurrency group
-  cancels stale runs on the same branch.
-- `.forgejo/workflows/claude-review.yaml` — loads
+- `.github/workflows/verify-pr.yaml` — `zig-gate` job runs the
+  per-PR tier; `evals` job runs `bun scripts/eval.ts --check`; `coverage`
+  measures kcov line coverage. Zig comes from `mise`, Bun from
+  `oven-sh/setup-bun`. A concurrency group cancels stale runs on the same
+  branch. The job name `Zig quality gate` is load-bearing: the readiness
+  broker reads it to record source-validation evidence.
+- `.github/workflows/claude-review.yaml` — loads
   `anthropics/claude-code-action@v1` in agent mode with
-  `max_turns: 8`, `setting_sources: project`, skills
+  `max_turns: 8`, `setting_sources: none`, skills
   `zig-quality,zig-build-system,zig-fuzz-target`. Falls back to
-  `.forgejo/prompts/review.md` if the external action is blocked.
-- `.forgejo/workflows/release.yaml` — tag-triggered skeleton only.
-  Real signing and SBOM is a separate flow (plan §0.12).
+  `.github/prompts/review.md` if the external action is blocked.
+- `.github/workflows/release.yaml` — `workflow_dispatch` tier-4
+  verification. It reads the broker's `Readiness Gate` status back with the
+  workflow token before running, and publishes its own result as the
+  `z3store/verify-release` commit status, which the broker records as
+  release-verification evidence. Real signing is a separate flow (plan §0.12).
 
 No secrets are inline. Workflows reference `${{ secrets.ANTHROPIC_API_KEY }}`
 by name only.

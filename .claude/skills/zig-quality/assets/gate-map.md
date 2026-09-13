@@ -29,8 +29,8 @@ failing check is showing up at the wrong tier.
 |---|---|---|---|
 | 1 | `scripts/verify-fast.ts` | `scripts/verify-fast.sh` | `PostToolUse(Write|Edit|MultiEdit)` → `.claude/hooks/posttooluse-zig.ts` (scoped); also `.claude/skills/verify/SKILL.md` for manual runs |
 | 2 | `scripts/verify-commit.ts` | `scripts/verify-commit.sh` | `Stop` → `.claude/hooks/stop-dod.ts`; `.claude/skills/verify/SKILL.md` |
-| 3 | `scripts/verify-pr.ts` | `scripts/verify-pr.sh` | `.forgejo/workflows/verify-pr.yaml`; `.claude/skills/verify/SKILL.md` |
-| 4 | `scripts/verify-release.ts` | `scripts/verify-release.sh` | `.forgejo/workflows/release.yaml` (tag event); `.claude/skills/release/SKILL.md` |
+| 3 | `scripts/verify-pr.ts` | `scripts/verify-pr.sh` | `.github/workflows/verify-pr.yaml`; `.claude/skills/verify/SKILL.md` |
+| 4 | `scripts/verify-release.ts` | `scripts/verify-release.sh` | `.github/workflows/release.yaml` (tag event); `.claude/skills/release/SKILL.md` |
 
 ## What runs at each tier
 

@@ -103,7 +103,7 @@ never lies" rule from plan §0.9.
 - Runtime: `scripts/verify-release.ts`.
 - Shim: `scripts/verify-release.sh` (`exec bun ... verify-release.ts`).
 - Manual skill entrypoint: `.claude/skills/release/SKILL.md`.
-- CI: `.forgejo/workflows/release.yaml` on tag event only.
+- CI: `.github/workflows/release.yaml` on tag event only.
 
 If the runtime cannot run a step because a dependency is missing
 (`cosign`, `syft`, etc.), the runtime logs the absence explicitly and

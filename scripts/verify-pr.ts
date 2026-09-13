@@ -17,7 +17,7 @@ import { appendJsonl, repoRoot, tail } from "./lib/runtime.ts";
  *   0 — pass
  *   1 — real failure (fuzz crash, build/test failure)
  */
-import { runReadinessCheck } from "./lib/readiness.ts";
+import { readinessMode, runReadinessCheck } from "./lib/readiness.ts";
 import {
 	runFuzz,
 	zig,
@@ -76,7 +76,7 @@ async function main(): Promise<void> {
 	const startedAt = Date.now();
 	const root = repoRoot();
 
-	console.log("== readiness gate (readiness/v1) ==");
+	console.log(`== readiness gate (readiness/v1, ${readinessMode()}) ==`);
 	const readiness = runReadinessCheck({ tier: TIER });
 	process.stdout.write(readiness.stdout);
 	process.stderr.write(readiness.stderr);

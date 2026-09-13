@@ -8,7 +8,7 @@ lands group by group.
 ## How coverage is measured
 
 - **CI-Linux (authoritative):** the `coverage` job in
-  `.forgejo/workflows/verify-pr.yaml` installs `kcov`, runs
+  `.github/workflows/verify-pr.yaml` installs `kcov`, runs
   `bun scripts/kcov-coverage.ts --print`, and enforces a threshold via
   `bun scripts/check-coverage.ts`. The report is uploaded as the `coverage`
   artifact.

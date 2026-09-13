@@ -1,2 +1,9 @@
 {"ts":"2026-09-12T13:34:53.272Z","event":"verify","tier":"pr","code":1,"durationMs":202}
 {"ts":"2026-09-12T13:34:53.476Z","event":"verify","tier":"pr","code":1,"durationMs":164}
+{"ts":"2026-09-13T14:35:14.369Z","event":"verify","tier":"pr","code":127,"durationMs":10}
+{"ts":"2026-09-13T14:35:14.420Z","event":"verify","tier":"release","code":127,"durationMs":8}
+{"ts":"2026-09-13T14:35:38.903Z","event":"verify","tier":"fast","code":1,"durationMs":4}
+{"ts":"2026-09-13T14:35:38.910Z","event":"verify","tier":"commit","code":1,"durationMs":45}
+{"ts":"2026-09-13T14:35:38.919Z","event":"verify","tier":"pr","code":1,"durationMs":146}
+{"ts":"2026-09-13T14:35:39.031Z","event":"verify","tier":"release","code":1,"durationMs":72}
+{"ts":"2026-09-13T14:35:39.199Z","event":"verify","tier":"pr","code":1,"durationMs":127}
