@@ -454,7 +454,7 @@ export function buildProgram(): WorkProgram {
 		repository: {
 			path: "<current-checkout>",
 			branch: "<current-branch>",
-			base: "origin/dev",
+			base: "origin/main",
 			head: "<current-head>",
 		},
 		objective:

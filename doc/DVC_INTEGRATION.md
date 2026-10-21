@@ -27,7 +27,7 @@ Live tracker note: the planning prompt referenced issue `#36`, but `gh issue vie
 
 `list.walk()` is the lowest-cost place to detect DVC metadata. `RepoEntry` already owns per-repo fields such as `rel_path`, `abs_path`, `host`, `owner`, `name`, `is_adopted`, `has_jj`, `worktrees`, `head_sha`, and `last_fetched_unix` (`src/list.zig:21`). `tryAppendRepo()` is reached after host/owner/name traversal and before appending each confirmed repo (`src/list.zig:152`). JSON output is centralized in `renderJson()` (`src/list.zig:335`).
 
-`verify()` checks one repo's adopted `.git` and `.jj` integrity (`src/gitstore.zig:543`). `verifyAll()` iterates entries and skips non-adopted repos (`src/gitstore.zig:628`). `status()` is a natural status-summary extension point, but still shells out to `ghq list --full-path` in current `dev` (`src/gitstore.zig:658`), so DVC status work should avoid deepening that dependency and should be compatible with the planned native-walk cleanup.
+`verify()` checks one repo's adopted `.git` and `.jj` integrity (`src/gitstore.zig:543`). `verifyAll()` iterates entries and skips non-adopted repos (`src/gitstore.zig:628`). `status()` is a natural status-summary extension point, but still shells out to `ghq list --full-path` on current `main` (`src/gitstore.zig:658`), so DVC status work should avoid deepening that dependency and should be compatible with the planned native-walk cleanup.
 
 CLI help and dispatch live in `src/main.zig`: top-level usage (`src/main.zig:14`), verify dispatch (`src/main.zig:472`), status dispatch (`src/main.zig:588`), sync dispatch (`src/main.zig:616`), and `filter` printing (`src/main.zig:684`). A `gitstore dvc` command should follow these dispatch/help conventions.
 
@@ -198,7 +198,7 @@ DagShub-backed tests must be optional and secret-gated. They must not depend on 
 - Passing too much environment to DVC can weaken the existing subprocess safety model.
 - Syncing `.dvc/cache` duplicates data and risks copying lock/temp state.
 - Repo argument semantics need a decision: explicit path only first, ghq-relative later if needed.
-- `gitstore status` still uses `ghq list` on current `dev`; DVC work should not make that harder to replace with native `list.walk()`.
+- `gitstore status` still uses `ghq list` on current `main`; DVC work should not make that harder to replace with native `list.walk()`.
 
 ## Rollback
 

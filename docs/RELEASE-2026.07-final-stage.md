@@ -2,6 +2,8 @@
 
 Final-stage **reference** freeze before a bare-minimum restart on `dev`.
 
+Live trunk is `origin/main`. The `dev` names below are 2026.07 freeze-time refs, including `archive/2026.07/origin-dev-at-freeze`. Do not open new work against `dev`.
+
 ## Release tip (`release/2026.07-final-stage`)
 
 Base: `origin/dev` @ freeze (includes converge PR #31).
@@ -21,10 +23,12 @@ Tag: `v2026.07-final-stage` (annotated).
 
 ## Tooling
 
+Freeze-time commands. Do not re-run them against `dev`.
+
 - `zt list -p --with-head z3store`
 - `wt switch --create release/2026.07-final-stage --base origin/dev`
 - `gt track --parent dev` — never squash-merge
 
 ## Fresh-start policy
 
-Rebuild `zt` from bare minimum on `dev`. Reintroduce from archive tips only when needed.
+The 2026.07 restart used `dev`. New work bases on `main`. Reintroduce from archive tips only when needed.

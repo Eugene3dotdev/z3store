@@ -164,8 +164,8 @@ refer to issues by title, not bare id. This affects the environment:
   Kubernetes) during charting — it is out of scope until the specs land.
   `doc/ARCHITECTURE.md` and `README.md` describe the zig-qm scaffold, not
   the vNext product.
-- **Estate live base is `origin/dev`** (not `main` or an archive HEAD);
-  z3store PRs are parked as drafts on `dev`.
+- **Estate live base is `origin/main`** (not an archive HEAD);
+  z3store draft PRs target `main`.
 - **Wayfinder handoffs / prior research** (`wayfinder/`, `research/`) live
   in the operator's local estate, not this GitHub repo — do not expect
   them here.

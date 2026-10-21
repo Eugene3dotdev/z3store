@@ -49,21 +49,21 @@ scripts are byte-identical to `dev`. It carries no unintegrated work.
 ### Canonical branch
 
 `main` is the trunk. It is brought level with `origin/dev` by a plain
-fast-forward, never a force push:
+fast-forward, never a force push. TEO-1162 then deletes `dev`:
 
 ```bash
 git fetch origin dev main
 git push origin origin/dev:main
 ```
 
-Post-condition: `git rev-parse origin/main` equals
-`git rev-parse origin/dev` before the next commit lands on `dev`.
+Post-condition of the fast-forward: `git rev-parse origin/main` equals
+the pre-push tip of `origin/dev`. No further commits land on `dev`
+before that push.
 
-Until that push has happened, `origin/dev` is the base for new work and
-the target for pull requests, because it is the only ref that holds the
-decided trunk content. After the push, new work bases on `main`.
-Whether `dev` stays as an integration branch or is retired is follow-on
-work and is not decided here.
+When this ADR was accepted the fast-forward had not happened, and
+`origin/dev` was the temporary base because it alone held the decided
+trunk. That interim is over. The live base is `origin/main`, and draft
+pull requests target `main`. `dev` is not kept as an integration branch.
 
 ### Residue disposition
 
@@ -106,10 +106,11 @@ check. Bare `gitstore` is deliberately not forbidden.
   the old adopter name and should be updated there too, or a future
   `ZIG_QM_OVERWRITE=1` re-scaffold will reintroduce it and the check will
   catch it.
-- **Follow-on work:** execute the fast-forward (TEO-7 task); decide the
-  fate of `dev` afterwards; remove the compatibility layer only after an
-  estate-wide check that no `.git`/`.jj` pointer references the legacy
-  store (TEO-843).
+- **Follow-on work:** execute the fast-forward and delete `dev`
+  (TEO-1162). This tree already names `main`, so the deletion does not
+  leave a live checkout target. Remove the compatibility layer only
+  after an estate-wide check that no `.git`/`.jj` pointer references
+  the legacy store (TEO-843).
 
 ## Alternatives considered
 
