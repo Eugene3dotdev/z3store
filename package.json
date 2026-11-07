@@ -4,6 +4,7 @@
 	"private": true,
 	"type": "module",
 	"description": "Zig 0.16 project scaffolded from zig-qm-toolkit (TS/Bun-first quality gate).",
+	"license": "MIT",
 	"engines": {
 		"bun": ">=1.1.0"
 	},

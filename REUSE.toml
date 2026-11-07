@@ -1,0 +1,8 @@
+version = 1
+SPDX-PackageName = "z3store"
+
+[[annotations]]
+path = "**"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Evgenii O. Tretiakov"
+SPDX-License-Identifier = "MIT"

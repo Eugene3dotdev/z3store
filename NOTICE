@@ -1,0 +1,10 @@
+DRAFT: this license is pending the governance decision on Linear issue "[GOVERNANCE][z3store] Resolve license, NOTICE, and public-release authority" (TEO-809).
+
+z3store
+Copyright (c) 2026 Evgenii O. Tretiakov
+
+This product is distributed under the MIT License; see the LICENSE file.
+
+z3store has no third-party runtime dependencies (build.zig.zon declares
+none). The `zt` binary is built with the Zig toolchain, whose standard
+library is MIT licensed.
