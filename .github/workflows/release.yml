@@ -439,8 +439,8 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
 
-      # Unconditional: the skip step below is Nu too, and the runner image
-      # ships none.
+      # Unconditional: the skip step below is Nu too, and this install is the
+      # only source of Nu the job may rely on.
       - name: Install toolchains from .mise.toml
         uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
         with:

@@ -25,12 +25,19 @@ function installsNu(step: Step): boolean {
 }
 
 describe("release workflow", () => {
-	// Every `run:` step is Nu and the runner image ships none, so a step that
-	// runs before an unconditional mise install fails with a missing shell.
+	// Every `run:` step is Nu, and Nu comes only from the mise install, which
+	// reads its pin from the checked-out `.mise.toml`. A step that runs before
+	// an unconditional install fails with a missing shell.
 	test("no job runs a step before mise has installed Nu", () => {
 		const early: string[] = [];
 		for (const [id, job] of Object.entries(workflow.jobs)) {
 			const installed = job.steps.findIndex(installsNu);
+			const checkout = job.steps.findIndex((step) =>
+				step.uses?.startsWith("actions/checkout@"),
+			);
+			if (installed !== -1 && (checkout === -1 || checkout > installed)) {
+				early.push(`${id}: mise install without a checkout before it`);
+			}
 			job.steps.forEach((step, i) => {
 				if (step.run === undefined) return;
 				if (installed === -1 || i < installed) {
