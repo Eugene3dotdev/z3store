@@ -430,29 +430,29 @@ jobs:
       # Secrets cannot appear in `if:`; expose only whether one is set.
       HAS_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_DISPATCH_TOKEN != '' }}
     steps:
-      - name: Skip without a tap dispatch token
-        if: env.HAS_TAP_TOKEN != 'true'
-        shell: nu {0}
-        run: print "HOMEBREW_TAP_DISPATCH_TOKEN not set; tap notification skipped"
-
       # A release event runs this file as it is at github.sha, the commit the
       # tag named when the Release was published. Check out that commit, not
       # the tag, so the code this job runs cannot differ from this file.
       - name: Checkout the released commit
-        if: env.HAS_TAP_TOKEN == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
 
+      # Unconditional: the skip step below is Nu too, and the runner image
+      # ships none.
       - name: Install toolchains from .mise.toml
-        if: env.HAS_TAP_TOKEN == 'true'
         uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
         with:
           version: 2026.9.9
           install: true
           install_args: bun nu gh
           cache: false
+
+      - name: Skip without a tap dispatch token
+        if: env.HAS_TAP_TOKEN != 'true'
+        shell: nu {0}
+        run: print "HOMEBREW_TAP_DISPATCH_TOKEN not set; tap notification skipped"
 
       # The step that imports repository code. No token is in its environment.
       # It shares the runner with the dispatch step, so this guards against an
