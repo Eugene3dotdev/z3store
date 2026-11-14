@@ -48,7 +48,7 @@ Fully healthy backing root means:
 - **No** path-derived `Users/…` or `Volumes/…` keys
 - **No** run/cache debris (`cel1021-*` class strays)
 
-**Important:** `status` green ≠ backing hygiene clean. Part 1 still documented misfiled keys, a `z3store`→`gitstore-cli` pointer mismatch, strays, and org-folder lag. Those are residual debt (TEO-902/905), not proof that “Drive sync works.”
+**Important:** `status` green ≠ backing hygiene clean. Part 1 still documented misfiled keys, a `z3store`→retired-project-name pointer mismatch, strays, and org-folder lag. Those are residual debt (TEO-902/905), not proof that “Drive sync works.”
 
 ---
 
@@ -119,9 +119,9 @@ Operator habit: **do not** run estate-wide `rclone sync` or legacy `zt sync` “
 **Usually is:** absolute-path adopt (historical) baked home or volume paths into key names.  
 **Do:** report; schedule cleanup under TEO-902/905. Do not delete blindly.
 
-### Pointer mismatch (checkout name ≠ backing key / gitstore-cli residue)
+### Pointer mismatch (checkout name ≠ backing key / residue of the retired project name)
 
-**Feels like:** you renamed the product to z3store but a checkout still points at `gitstore-cli`.  
+**Feels like:** you renamed the product to z3store but a checkout still points at the retired project name.  
 **Usually is:** identity rename shipped; on-disk pointer not fully migrated.  
 **Do:** report exact `gitdir:` target; do not equate this with a Drive folder-rename fix (Part 1b).
 

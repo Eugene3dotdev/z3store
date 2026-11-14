@@ -101,7 +101,7 @@ See in-repo `docs/MIGRATION-ghq-to-gitstore.md` for historical migration steps a
 
 ### Compat: `gitstore.*` / `GITSTORE_*` read until estate clear
 
-Keep reading legacy keys for diagnosis. Do not teach new config as `gitstore.*`. Public identity `gitstore-cli` / EugOT product URLs are **retired** (PRs #24/#25/#47 + ADR 0005 Remove class). Trunk policy: FF `main` ← `dev` when TEO-978 lands (still backlog).
+Keep reading legacy keys for diagnosis. Do not teach new config as `gitstore.*`. Public identity under the retired project name / EugOT product URLs are **retired** (PRs #24/#25/#47 + ADR 0005 Remove class). Trunk policy: FF `main` ← `dev` when TEO-978 lands (still backlog).
 
 ---
 
@@ -124,7 +124,7 @@ Identity rename PRs (#24/#25/#47) did **not** fix Drive folder-rename / recovery
 | Kind | Example / note |
 |------|----------------|
 | Path-derived misfiled keys | `…/gitstore/Users/…`, `…/gitstore/Volumes/…` — prefer refuse/remap going forward |
-| Checkout→key mismatch | `EugOT/z3store` checkout `.git` → `gitstore-cli` key |
+| Checkout→key mismatch | the retired owner's `z3store` checkout `.git` → key under the retired project name |
 | Backing strays | `cel1021-*`, oversized run/cache debris; `operations.log` under backing |
 | Namespace lag | Many `EugOT/*` checkouts with `Eugene3dotdev/*` remotes; dual backing namespaces — TEO-905 lever incomplete on disk |
 

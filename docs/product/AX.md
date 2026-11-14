@@ -90,7 +90,7 @@ These are the default agent toolkit:
 - Prefer `zt get … --no-adopt` when the agent only needs a working tree and adopt is unsafe or version-skewed.
 - **Do not adopt** under known **0.3.1 jjColocate skew** without an explicit pin / version that honors `jjColocate=false` (TEO-982 source-fixed; installed 0.3.1 may still skew — treat as release gate, not agent improvisation).
 - Do not adopt in a way that creates **path-derived absolute keys** (`Users/…`, `Volumes/…`). Prefer refuse or remap; those shapes are Part 1 residuals from absolute-path adopt (PR #3 era), not intended key layout. Canonical keys are `host/owner/repo` under the backing root.
-- Do not blindly re-adopt to “fix” pointer mismatch (e.g. `z3store` checkout → `gitstore-cli` key). Report; hand to human / TEO-905 lane.
+- Do not blindly re-adopt to “fix” pointer mismatch (e.g. `z3store` checkout → key under the retired project name). Report; hand to human / TEO-905 lane.
 
 ### Read-only lore / root / hook forwarder notes
 
@@ -132,7 +132,7 @@ DriveFS Lost-and-Found historical shells ≠ current z3store transfers.
 
 ### Writing new `gitstore.*` config keys
 
-Legacy `gitstore.*` / `GITSTORE_*` remain a **read** compat path (ADR 0005 Keep) until estate-wide pointer proof. Agents must **not** write new `gitstore.*` keys. Teach and emit only current `z3store` / `zt` config identity. Public `gitstore-cli` / EugOT URL residue is already retired — do not resurrect in help text, docs, or agent prompts.
+Legacy `gitstore.*` / `GITSTORE_*` remain a **read** compat path (ADR 0005 Keep) until estate-wide pointer proof. Agents must **not** write new `gitstore.*` keys. Teach and emit only current `z3store` / `zt` config identity. Public residue of the retired project name / EugOT URL is already retired — do not resurrect in help text, docs, or agent prompts.
 
 ---
 
@@ -144,7 +144,7 @@ Agents may **read** legacy env/config for diagnosis (`GITSTORE_*`, `gitstore.*`)
 
 ### Public identity residue (already retired)
 
-Do not teach agents to clone, advertise, or prefer `gitstore-cli` / old EugOT product URLs. Canonical product repo: `Eugene3dotdev/z3store`. Identity rename PRs (#24 / #25 / #47) fixed **product naming**, not Drive folder-rename — agents must not conflate the two (Part 1b).
+Do not teach agents to clone, advertise, or prefer the retired project name / old EugOT product URLs. Canonical product repo: `Eugene3dotdev/z3store`. Identity rename PRs (#24 / #25 / #47) fixed **product naming**, not Drive folder-rename — agents must not conflate the two (Part 1b).
 
 ### Version pin / Homebrew baseline awareness
 
@@ -164,7 +164,7 @@ Agent action: report host stamp (`which`, realpath, brew version); do not mutate
 Symptoms (Part 1 census patterns):
 
 - Backing keys under `Users/…` or `Volumes/…`
-- Checkout `.git` pointing at a retired key name (e.g. `gitstore-cli` while checkout is `z3store`)
+- Checkout `.git` pointing at a retired key name (e.g. the retired project name while checkout is `z3store`)
 - `cel1021-*` / run-cache debris under backing root
 - Org-folder lag (`EugOT/*` checkouts vs `Eugene3dotdev/*` remotes)
 
