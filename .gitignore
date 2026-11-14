@@ -8,5 +8,8 @@ zig-out/
 
 node_modules/
 
+# release archive build output
+dist/
+
 # kcov coverage artifacts (CI-Linux); summary is regenerated each run
 coverage/

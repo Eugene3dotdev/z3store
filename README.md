@@ -6,6 +6,17 @@ A Zig 0.16 project scaffolded from
 [`zig-qm-toolkit`](./doc/ARCHITECTURE.md), with a TS/Bun-first
 four-tier quality gate.
 
+## Install
+
+```nu
+mise use -g github:Eugene3dotdev/z3store
+mise use -g packslip:github.com/Eugene3dotdev/z3store
+brew install eugene3dotdev/tap/z3store
+```
+
+What each route verifies, checking `SHA256SUMS` by hand, version pinning and
+the PATH-shadow check: [`docs/INSTALL.md`](docs/INSTALL.md).
+
 ## Prerequisites
 
 - Zig `0.16.0` and ZLS `0.16.0` (resolved through `mise`).
@@ -33,6 +44,28 @@ bun scripts/verify-fast.ts        # tier 1 (<2s) — fmt + ast-check
 bun scripts/verify-commit.ts      # tier 2 (~30s) — fast + tests + API drift
 bun scripts/verify-pr.ts          # tier 3 (~10min) — commit + cross-target + safety + fuzz
 ```
+
+## Storage roots
+
+z3store keeps two independent roots:
+
+| Root | Purpose | Primary setting |
+|---|---|---|
+| Working-tree root | `host/owner/repository` checkout namespace used by `root`, `list`, and `get` | `z3store.root` or `Z3STORE_ROOT` |
+| Backing-store root | Detached Git/JJ databases, cache, and `operations.log` | `z3store.backingStoreRoot` or `Z3STORE_BACKING_STORE_ROOT` |
+
+```bash
+git config --global z3store.root /Volumes/Crucial/ghq
+git config --global z3store.backingStoreRoot /Volumes/Crucial/gitstore
+
+zt root
+zt status --json
+```
+
+Existing absolute `.git` pointer files are not rewritten merely because a
+different backing root is selected. Legacy `gitstore.backingStoreRoot` and
+`GITSTORE_BACKING_STORE_ROOT` remain supported during migration. See
+[`docs/MIGRATION-ghq-to-gitstore.md`](docs/MIGRATION-ghq-to-gitstore.md).
 
 ## Quality gates
 

@@ -1,246 +1,174 @@
 import { expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-	canonicalizeReleaseArtifactBytes,
-	hashDir,
+	type BuildAdapter,
+	RELEASE_TARGETS,
+} from "../../scripts/lib/release-manifest.ts";
+import {
+	cleanArtifacts,
+	hashReleaseBuilds,
+	reproducibilityDrift,
 } from "../../scripts/verify-release.ts";
 
-const enc = new TextEncoder();
+test("two passes with the same hash per target show no drift", () => {
+	const pass = new Map([
+		["x86_64-linux-musl", "4f00"],
+		["aarch64-macos", "c859"],
+	]);
+	expect(reproducibilityDrift(pass, new Map(pass))).toEqual([]);
+});
 
-function syntheticMachO(
-	uuidByte: number,
-	cacheHash: string,
-	linkeditByte = uuidByte,
-	osoTimestampByte = uuidByte,
-	codeSignatureByte = uuidByte,
-): Uint8Array {
-	const headerSize = 32;
-	const segmentCommandSize = 72;
-	const uuidCommandSize = 24;
-	const symtabCommandSize = 24;
-	const codeSignatureCommandSize = 16;
-	const path = enc.encode(`/tmp/project/.zig-cache/o/${cacheHash}/zt_zcu.o`);
-	const commandSize =
-		segmentCommandSize +
-		uuidCommandSize +
-		symtabCommandSize +
-		codeSignatureCommandSize;
-	const pathOffset = headerSize + commandSize;
-	const symbolTableOffset = pathOffset + path.byteLength;
-	const codeSignatureSize = 64;
-	const codeSignatureOffset = symbolTableOffset + 16;
-	const linkeditSize = 32;
-	const linkeditOffset = codeSignatureOffset + codeSignatureSize;
-	const out = new Uint8Array(linkeditOffset + linkeditSize);
-	const view = new DataView(out.buffer);
-
-	view.setUint32(0, 0xfeedfacf, true); // Mach-O 64-bit, little-endian
-	view.setUint32(16, 4, true); // ncmds
-	view.setUint32(20, commandSize, true); // sizeofcmds
-
-	view.setUint32(headerSize, 0x19, true); // LC_SEGMENT_64
-	view.setUint32(headerSize + 4, segmentCommandSize, true);
-	out.set(enc.encode("__LINKEDIT"), headerSize + 8);
-	view.setBigUint64(headerSize + 40, BigInt(symbolTableOffset), true);
-	view.setBigUint64(
-		headerSize + 48,
-		BigInt(out.byteLength - symbolTableOffset),
-		true,
+test("a target whose hash changed between passes is drift", () => {
+	const drift = reproducibilityDrift(
+		new Map([
+			["x86_64-linux-musl", "1b39"],
+			["aarch64-macos", "c859"],
+		]),
+		new Map([
+			["x86_64-linux-musl", "e0dc"],
+			["aarch64-macos", "c859"],
+		]),
 	);
+	expect(drift).toEqual(["x86_64-linux-musl: first 1b39, second e0dc"]);
+});
 
-	const uuidOffset = headerSize + segmentCommandSize;
-	view.setUint32(uuidOffset, 0x1b, true); // LC_UUID
-	view.setUint32(uuidOffset + 4, uuidCommandSize, true);
-	out.fill(uuidByte, uuidOffset + 8, uuidOffset + 24);
-
-	const symtabOffset = uuidOffset + uuidCommandSize;
-	view.setUint32(symtabOffset, 0x2, true); // LC_SYMTAB
-	view.setUint32(symtabOffset + 4, symtabCommandSize, true);
-	view.setUint32(symtabOffset + 8, symbolTableOffset, true);
-	view.setUint32(symtabOffset + 12, 1, true); // nsyms
-	view.setUint32(symtabOffset + 16, pathOffset, true);
-	view.setUint32(symtabOffset + 20, path.byteLength, true);
-
-	const codeSignatureCommandOffset = symtabOffset + symtabCommandSize;
-	view.setUint32(codeSignatureCommandOffset, 0x1d, true); // LC_CODE_SIGNATURE
-	view.setUint32(
-		codeSignatureCommandOffset + 4,
-		codeSignatureCommandSize,
-		true,
+test("a target built in only one pass is drift", () => {
+	const drift = reproducibilityDrift(
+		new Map([["x86_64-macos", "b01c"]]),
+		new Map(),
 	);
-	view.setUint32(codeSignatureCommandOffset + 8, codeSignatureOffset, true);
-	view.setUint32(codeSignatureCommandOffset + 12, codeSignatureSize, true);
+	expect(drift).toEqual(["x86_64-macos: first b01c, second (not built)"]);
+});
 
-	out.set(path, pathOffset);
-	view.setUint32(symbolTableOffset, 0, true);
-	out[symbolTableOffset + 4] = 0x66; // N_OSO
-	view.setUint16(symbolTableOffset + 6, 1, true);
-	out.fill(osoTimestampByte, symbolTableOffset + 8, symbolTableOffset + 16);
-	out.fill(
-		codeSignatureByte,
-		codeSignatureOffset,
-		codeSignatureOffset + codeSignatureSize,
+test("a target built only in the second pass is drift", () => {
+	const drift = reproducibilityDrift(
+		new Map([["aarch64-macos", "c859"]]),
+		new Map([
+			["aarch64-macos", "c859"],
+			["x86_64-macos", "b01c"],
+		]),
 	);
-	out.fill(linkeditByte, linkeditOffset, linkeditOffset + linkeditSize);
+	expect(drift).toEqual(["x86_64-macos: first (not built), second b01c"]);
+});
 
-	return out;
+test("two passes that built nothing prove nothing", () => {
+	expect(reproducibilityDrift(new Map(), new Map())).toEqual([
+		"no release target was built",
+	]);
+});
+
+const TRIPLES = RELEASE_TARGETS.map((target) => target.zigTriple);
+
+function newRoot(): string {
+	return mkdtempSync(join(tmpdir(), "verify-release-"));
 }
 
-function malformedUuidMachO(): Uint8Array {
-	const headerSize = 32;
-	const uuidCommandSize = 16;
-	const sentinelSize = 16;
-	const sentinelOffset = headerSize + uuidCommandSize;
-	const out = new Uint8Array(sentinelOffset + sentinelSize);
-	const view = new DataView(out.buffer);
-
-	view.setUint32(0, 0xfeedfacf, true); // Mach-O 64-bit, little-endian
-	view.setUint32(16, 1, true); // ncmds
-	view.setUint32(20, uuidCommandSize, true); // sizeofcmds
-	view.setUint32(headerSize, 0x1b, true); // LC_UUID
-	view.setUint32(headerSize + 4, uuidCommandSize, true);
-	out.fill(0xaa, headerSize + 8, sentinelOffset);
-	out.fill(0xee, sentinelOffset, sentinelOffset + sentinelSize);
-
-	return out;
+function sha256(text: string): string {
+	return new Bun.CryptoHasher("sha256").update(text).digest("hex");
 }
 
-function malformedAfterUuidMachO(): Uint8Array {
-	const headerSize = 32;
-	const uuidCommandSize = 24;
-	const truncatedCommandSize = 4;
-	const sentinelSize = 16;
-	const sentinelOffset = headerSize + uuidCommandSize + truncatedCommandSize;
-	const out = new Uint8Array(sentinelOffset + sentinelSize);
-	const view = new DataView(out.buffer);
-
-	view.setUint32(0, 0xfeedfacf, true); // Mach-O 64-bit, little-endian
-	view.setUint32(16, 2, true); // ncmds
-	view.setUint32(20, uuidCommandSize + truncatedCommandSize, true);
-	view.setUint32(headerSize, 0x1b, true); // LC_UUID
-	view.setUint32(headerSize + 4, uuidCommandSize, true);
-	out.fill(0xaa, headerSize + 8, headerSize + uuidCommandSize);
-	out.fill(0xee, sentinelOffset, sentinelOffset + sentinelSize);
-
-	return out;
+// Stands in for the release build. The gate appends `--prefix <dir>`; the stub
+// installs `bin/zt` there when told to, then exits with the given code.
+function stubAdapter(behaviour: {
+	install: boolean;
+	exitCode: number;
+}): BuildAdapter {
+	const script = join(newRoot(), "stub-build.ts");
+	writeFileSync(
+		script,
+		[
+			'import { mkdirSync, writeFileSync } from "node:fs";',
+			'import { join } from "node:path";',
+			"const [triple, install, exitCode] = process.argv.slice(2);",
+			'const prefix = process.argv[process.argv.indexOf("--prefix") + 1] ?? "";',
+			'if (install === "install") {',
+			'	mkdirSync(join(prefix, "bin"), { recursive: true });',
+			'	writeFileSync(join(prefix, "bin", "zt"), "binary for " + triple);',
+			"}",
+			"process.exit(Number(exitCode));",
+		].join("\n"),
+	);
+	return {
+		kind: "zig",
+		toolchain: "stub",
+		buildCommand: (target) => [
+			"bun",
+			script,
+			target.zigTriple,
+			behaviour.install ? "install" : "skip",
+			String(behaviour.exitCode),
+		],
+		outputPath: () => "zig-out/bin/zt",
+	};
 }
 
-test("release artifact canonicalization removes Darwin linker/cache noise", () => {
-	const a = syntheticMachO(
-		0xaa,
-		"0123456789abcdef0123456789abcdef",
-		0xcc,
-		0xee,
-		0xee,
-	);
-	const b = syntheticMachO(
-		0xbb,
-		"fedcba9876543210fedcba9876543210",
-		0xcc,
-		0xee,
-		0xee,
-	);
-
-	expect(canonicalizeReleaseArtifactBytes(a)).toEqual(
-		canonicalizeReleaseArtifactBytes(b),
-	);
-});
-
-test("release artifact canonicalization preserves LINKEDIT drift", () => {
-	const a = syntheticMachO(0xaa, "0123456789abcdef0123456789abcdef", 0xcc);
-	const b = syntheticMachO(0xaa, "0123456789abcdef0123456789abcdef", 0xdd);
-
-	expect(canonicalizeReleaseArtifactBytes(a)).not.toEqual(
-		canonicalizeReleaseArtifactBytes(b),
-	);
-});
-
-test("release artifact canonicalization removes OSO timestamp drift", () => {
-	const a = syntheticMachO(
-		0xaa,
-		"0123456789abcdef0123456789abcdef",
-		0xcc,
-		0x11,
-		0xee,
-	);
-	const b = syntheticMachO(
-		0xaa,
-		"0123456789abcdef0123456789abcdef",
-		0xcc,
-		0x22,
-		0xee,
-	);
-
-	expect(canonicalizeReleaseArtifactBytes(a)).toEqual(
-		canonicalizeReleaseArtifactBytes(b),
-	);
-});
-
-test("release artifact canonicalization removes code signature drift", () => {
-	const a = syntheticMachO(
-		0xaa,
-		"0123456789abcdef0123456789abcdef",
-		0xcc,
-		0xee,
-		0x11,
-	);
-	const b = syntheticMachO(
-		0xaa,
-		"0123456789abcdef0123456789abcdef",
-		0xcc,
-		0xee,
-		0x22,
-	);
-
-	expect(canonicalizeReleaseArtifactBytes(a)).toEqual(
-		canonicalizeReleaseArtifactBytes(b),
-	);
-});
-
-test("release artifact canonicalization ignores malformed short LC_UUID", () => {
-	const malformed = malformedUuidMachO();
-
-	expect(canonicalizeReleaseArtifactBytes(malformed)).toEqual(malformed);
-});
-
-test("release artifact canonicalization discards partial malformed Mach-O edits", () => {
-	const malformed = malformedAfterUuidMachO();
-
-	expect(canonicalizeReleaseArtifactBytes(malformed)).toEqual(malformed);
-});
-
-test("release artifact canonicalization leaves non-Mach-O bytes untouched", () => {
-	const a = enc.encode("plain artifact a");
-	const b = enc.encode("plain artifact b");
-
-	expect(canonicalizeReleaseArtifactBytes(a)).toEqual(a);
-	expect(canonicalizeReleaseArtifactBytes(b)).toEqual(b);
-});
-
-test("release artifact canonicalization leaves short inputs untouched", () => {
-	const short = enc.encode("short");
-
-	expect(canonicalizeReleaseArtifactBytes(short)).toEqual(short);
-});
-
-test("hashDir frames canonicalized Mach-O release artifacts", async () => {
-	const aDir = await mkdtemp(join(tmpdir(), "z3store-release-a-"));
-	const bDir = await mkdtemp(join(tmpdir(), "z3store-release-b-"));
-	try {
-		await Bun.write(
-			join(aDir, "zt"),
-			syntheticMachO(0x11, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 0x33),
-		);
-		await Bun.write(
-			join(bDir, "zt"),
-			syntheticMachO(0x22, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 0x33),
-		);
-
-		expect(await hashDir(aDir)).toBe(await hashDir(bDir));
-	} finally {
-		await rm(aDir, { recursive: true, force: true });
-		await rm(bDir, { recursive: true, force: true });
+test("cleanArtifacts removes the project cache and the install tree", async () => {
+	const root = newRoot();
+	for (const dir of [".zig-cache", "zig-out"]) {
+		mkdirSync(join(root, dir, "nested"), { recursive: true });
+		writeFileSync(join(root, dir, "nested", "stale"), "stale");
 	}
+	writeFileSync(join(root, "build.zig"), "kept");
+
+	await cleanArtifacts(root);
+	await cleanArtifacts(root);
+
+	expect(readdirSync(root)).toEqual(["build.zig"]);
+});
+
+test("hashReleaseBuilds hashes the binary each release target installed", async () => {
+	const hashes = await hashReleaseBuilds(
+		newRoot(),
+		stubAdapter({ install: true, exitCode: 0 }),
+	);
+	expect([...hashes.keys()]).toEqual(TRIPLES);
+	for (const triple of TRIPLES) {
+		expect(hashes.get(triple)).toBe(sha256(`binary for ${triple}`));
+	}
+});
+
+test("hashReleaseBuilds starts from an empty project cache", async () => {
+	const root = newRoot();
+	mkdirSync(join(root, ".zig-cache", "o"), { recursive: true });
+	writeFileSync(join(root, ".zig-cache", "o", "stale"), "stale");
+	mkdirSync(join(root, "zig-out", "bin"), { recursive: true });
+	writeFileSync(join(root, "zig-out", "bin", "zt"), "native build");
+
+	await hashReleaseBuilds(root, stubAdapter({ install: true, exitCode: 0 }));
+
+	expect(existsSync(join(root, ".zig-cache"))).toBe(false);
+	expect(readFileSync(join(root, "zig-out", "bin", "zt"), "utf8")).toBe(
+		"native build",
+	);
+});
+
+test("hashReleaseBuilds does not hash a binary an earlier pass left", async () => {
+	const root = newRoot();
+	for (const triple of TRIPLES) {
+		const bin = join(root, "zig-out", "reproducibility", triple, "bin");
+		mkdirSync(bin, { recursive: true });
+		writeFileSync(join(bin, "zt"), "earlier pass");
+	}
+	const pass = hashReleaseBuilds(
+		root,
+		stubAdapter({ install: false, exitCode: 0 }),
+	);
+	await expect(pass).rejects.toThrow(`release build for ${TRIPLES[0]} left no`);
+});
+
+test("hashReleaseBuilds fails a build that exits non-zero, even with a binary", async () => {
+	const pass = hashReleaseBuilds(
+		newRoot(),
+		stubAdapter({ install: true, exitCode: 1 }),
+	);
+	await expect(pass).rejects.toThrow(`release build failed for ${TRIPLES[0]}`);
 });
