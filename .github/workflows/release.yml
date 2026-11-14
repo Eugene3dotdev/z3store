@@ -1,0 +1,543 @@
+# Release pipeline for z3store (TEO-1342).
+#
+# This file's path is the packslip signer identity (RELEASE_WORKFLOW_PATH in
+# scripts/lib/release-manifest.ts). Do not rename or move it, and keep the
+# signing step in this file: consumers pin the repository id plus this path.
+#
+# Tag push vX.Y.Z:   verify -> build -> attest -> packslip -> publish (draft)
+# workflow_dispatch: verify -> build only. A dry run never attests, signs or
+#                    creates a Release, because signatures and attestations
+#                    from a non-tag ref are permanent public records.
+# release published: notify-tap only, once the owner publishes the draft, so
+#                    the tap never points at assets anonymous clients cannot
+#                    download yet.
+#
+# Asset names, the tag grammar and the tap repository come from the release
+# manifest at run time; nothing below restates them.
+#
+# Repository settings this file relies on and cannot set:
+# - A tag ruleset that blocks update and deletion of v* tags. A tag is a
+#   mutable ref. The jobs below pin the commit once and re-read the tag before
+#   the Release is created, and notify-tap compares the tag with the
+#   provenance of the published assets. None of that stops a tag from moving;
+#   it only stops this pipeline from following the move.
+# - Required reviewers on the homebrew-tap environment. A release event runs
+#   this file as it is at the tagged commit, so a commit that reaches a
+#   published v* tag also brings its own notify-tap job. A deployment rule
+#   that admits v* tags admits that commit too.
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing vX.Y.Z tag to dry-run (verify and build only; no attestation, signature or Release)."
+        required: true
+        type: string
+  release:
+    types:
+      - published
+
+permissions: {}
+
+defaults:
+  run:
+    shell: nu {0}
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name || github.ref_name }}
+
+concurrency:
+  group: release-${{ inputs.tag || github.event.release.tag_name || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify release gate
+    if: github.event_name != 'release'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      FUZZ_BUDGET_SECONDS: "300"
+    outputs:
+      commit: ${{ steps.commit.outputs.commit }}
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
+      prerelease: ${{ steps.tag.outputs.prerelease }}
+      binary: ${{ steps.tag.outputs.binary }}
+      sbom: ${{ steps.tag.outputs.sbom }}
+      checksum_file: ${{ steps.tag.outputs.checksum_file }}
+      archive_paths: ${{ steps.tag.outputs.archive_paths }}
+      archives: ${{ steps.tag.outputs.archives }}
+      build_assets: ${{ steps.tag.outputs.build_assets }}
+      release_assets: ${{ steps.tag.outputs.release_assets }}
+    steps:
+      - name: Checkout the tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install toolchains from .mise.toml
+        uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+        with:
+          version: 2026.9.9
+          install: true
+          cache: false
+
+      # A tag is a mutable ref. This is the only job that resolves it; build
+      # and publish check out the commit recorded here, so a tag moved while
+      # the run is in flight cannot swap the source after the gate passed.
+      # On a tag push the commit must also be the one that started the run,
+      # because the attestation names github.sha as the source.
+      - name: Bind the run to the commit behind the tag
+        id: commit
+        shell: nu {0}
+        run: |
+          let head = (^git rev-parse --verify "HEAD^{commit}" | complete)
+          if $head.exit_code != 0 {
+            error make { msg: $"cannot resolve the checked-out commit: ($head.stderr)" }
+          }
+          let commit = ($head.stdout | str trim)
+          if $env.GITHUB_EVENT_NAME == "push" {
+            let pushed = (^git rev-parse --verify $"($env.GITHUB_SHA)^{commit}" | complete)
+            if $pushed.exit_code != 0 {
+              error make { msg: $"cannot resolve the pushed object ($env.GITHUB_SHA): ($pushed.stderr)" }
+            }
+            let pushed_commit = ($pushed.stdout | str trim)
+            if $pushed_commit != $commit {
+              error make { msg: $"tag ($env.RELEASE_TAG) moved: the push was ($pushed_commit), the tag now resolves to ($commit)" }
+            }
+          }
+          $"commit=($commit)\n" | save --append $env.GITHUB_OUTPUT
+          print $"release ($env.RELEASE_TAG) is bound to commit ($commit)"
+
+      - name: Resolve tag through the release manifest
+        id: tag
+        shell: nu {0}
+        run: |
+          let r = (^bun -e r#'
+          import * as m from "./scripts/lib/release-manifest.ts";
+          const t = m.parseReleaseTag(process.env.RELEASE_TAG ?? "");
+          if (t === null) {
+            console.error(`not a release tag: ${process.env.RELEASE_TAG}`);
+            process.exit(1);
+          }
+          console.log(JSON.stringify({
+            tag: t.tag,
+            version: t.version,
+            prerelease: t.prerelease !== null,
+            binary: m.BINARY_NAME,
+            sbom: m.sbomName(t.version),
+            checksum_file: m.CHECKSUM_FILE,
+            archives: m.RELEASE_TARGETS.map((x) => m.archiveName(t.version, x)),
+            build_assets: m.buildAssetNames(t.version),
+            release_assets: m.releaseAssetNames(t.version),
+          }));
+          '# | complete)
+          if $r.exit_code != 0 {
+            error make { msg: $"release manifest rejected tag: ($r.stderr)" }
+          }
+          let t = ($r.stdout | from json)
+          let lists = [archives build_assets release_assets]
+          let paths = ($t.archives | each {|f| $"dist/($f)" } | str join " ")
+          $t
+          | transpose key value
+          | each {|kv|
+              let v = if $kv.key in $lists { $kv.value | to json --raw } else { $kv.value | into string }
+              $"($kv.key)=($v)\n"
+            }
+          | append $"archive_paths=($paths)\n"
+          | str join
+          | save --append $env.GITHUB_OUTPUT
+          print $"release ($t.tag): version ($t.version), prerelease ($t.prerelease)"
+
+      - name: Install Bun dependencies
+        shell: nu {0}
+        run: ^bun ci
+
+      - name: Check tag matches the version source
+        shell: nu {0}
+        run: ^bun scripts/check-version-tag.ts $env.RELEASE_TAG
+
+      - name: Run verify-release gate
+        shell: nu {0}
+        run: ^bun scripts/verify-release.ts
+
+  build:
+    name: Build release assets
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout the verified commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.verify.outputs.commit }}
+          persist-credentials: false
+
+      - name: Install toolchains from .mise.toml
+        uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+        with:
+          version: 2026.9.9
+          install: true
+          cache: false
+
+      - name: Install Bun dependencies
+        shell: nu {0}
+        run: ^bun ci
+
+      - name: Build every release target
+        shell: nu {0}
+        run: ^bun scripts/release-build.ts --out dist
+
+      - name: Check dist matches the manifest and SHA256SUMS
+        shell: nu {0}
+        env:
+          BUILD_ASSETS: ${{ needs.verify.outputs.build_assets }}
+          ARCHIVES: ${{ needs.verify.outputs.archives }}
+          CHECKSUM_FILE: ${{ needs.verify.outputs.checksum_file }}
+        run: |
+          let expected = ($env.BUILD_ASSETS | from json | sort)
+          let actual = (ls dist | get name | path basename | sort)
+          if $actual != $expected {
+            error make { msg: $"dist mismatch: expected ($expected | to nuon), got ($actual | to nuon)" }
+          }
+          let sums = (open --raw $"dist/($env.CHECKSUM_FILE)" | lines | where $it != "" | parse "{hash}  {file}")
+          let listed = ($sums | get file)
+          if $listed != ($listed | sort) {
+            error make { msg: "checksum file is not sorted by name" }
+          }
+          let missing = ($env.ARCHIVES | from json | where $it not-in $listed)
+          let stray = ($listed | where {|f| ($f not-in $expected) or ($f == $env.CHECKSUM_FILE) })
+          if ($missing | is-not-empty) or ($stray | is-not-empty) {
+            error make { msg: $"checksum file: missing ($missing | to nuon), unexpected ($stray | to nuon)" }
+          }
+          for row in $sums {
+            let got = (open --raw $"dist/($row.file)" | hash sha256)
+            if $got != $row.hash {
+              error make { msg: $"checksum mismatch for ($row.file)" }
+            }
+          }
+          print $"dist OK: ($actual | str join ', ')"
+
+      - name: Upload build assets
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  attest:
+    name: Attest build provenance
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write # Sigstore certificate for the provenance signature.
+      attestations: write # Store attestations through the attestations API.
+    steps:
+      - name: Download build assets
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-dist
+          path: dist
+
+      # The build job proved dist holds exactly buildAssetNames(version):
+      # every archive, the checksum file and the SBOM.
+      - name: Attest archives, checksum file and SBOM
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*
+
+  packslip:
+    name: Sign packslip manifest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: [verify, attest]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read # Cannot change the Release.
+      id-token: write # Sign the manifest with this workflow's identity.
+    steps:
+      - name: Download build assets
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-dist
+          path: dist
+
+      # Staged archives, not `download:`: a contents: read token cannot see
+      # the draft Release, and the Release does not exist yet. The attest job
+      # already attested these files, so the packslip only links them.
+      - name: Sign the release manifest keylessly
+        id: packslip
+        uses: jdx/packslip@44e50e5f64551234b4a382d991bd7f7f7d021d06 # v1.11.3
+        with:
+          tag: ${{ needs.verify.outputs.tag }}
+          version: ${{ needs.verify.outputs.version }}
+          artifacts: ${{ needs.verify.outputs.archive_paths }}
+          bin: ${{ needs.verify.outputs.binary }}
+          resources: |
+            sbom/cyclonedx=asset:dist/${{ needs.verify.outputs.sbom }}
+          attest: link
+          upload: false
+
+      - name: Upload packslip bundle
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: packslip-bundle
+          path: ${{ steps.packslip.outputs.bundle }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Create draft Release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: [verify, build, attest, packslip]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write # Create the draft Release and upload its assets.
+    steps:
+      - name: Checkout the verified commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.verify.outputs.commit }}
+          persist-credentials: false
+
+      - name: Install Nu and gh from .mise.toml
+        uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+        with:
+          version: 2026.9.9
+          install: true
+          install_args: nu gh
+          cache: false
+
+      # The runner image ships its own gh. Installing the pin does not prove
+      # the pin is the copy on PATH, so compare before gh does any work.
+      - name: Check gh is the copy pinned in .mise.toml
+        shell: nu {0}
+        run: |
+          let pinned = (open .mise.toml | get tools.gh)
+          let running = (^gh --version | lines | first | split row " " | get 2)
+          if $running != $pinned {
+            error make { msg: $"gh on PATH is ($running), .mise.toml pins ($pinned)" }
+          }
+          print $"gh ($running) from (which gh | get path.0)"
+
+      - name: Download build assets
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-dist
+          path: dist
+
+      - name: Download packslip bundle
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: packslip-bundle
+          path: dist
+
+      # The Release is created for the tag by name, so the tag must still name
+      # the commit that was verified, built and attested. This narrows the
+      # window and does not close it: `--verify-tag` below checks only that
+      # the tag exists, so a tag moved between this read and the create call
+      # goes unseen here. See "Repository settings" at the top of this file.
+      - name: Check the tag still names the verified commit
+        shell: nu {0}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.verify.outputs.tag }}
+          COMMIT: ${{ needs.verify.outputs.commit }}
+        run: |
+          def tag-object [path: string] {
+            let r = (^gh api $"repos/($env.GITHUB_REPOSITORY)/git/($path)" | complete)
+            if $r.exit_code != 0 {
+              error make { msg: $"cannot read ($path): ($r.stderr)" }
+            }
+            $r.stdout | from json | get object
+          }
+          mut object = (tag-object $"ref/tags/($env.TAG)")
+          # An annotated tag points at a tag object; follow it to the commit.
+          mut hops = 0
+          while $object.type == "tag" and $hops < 4 {
+            $object = (tag-object $"tags/($object.sha)")
+            $hops += 1
+          }
+          if $object.type != "commit" or $object.sha != $env.COMMIT {
+            error make { msg: $"tag ($env.TAG) moved: verified ($env.COMMIT), the tag now names ($object.type) ($object.sha)" }
+          }
+          print $"tag ($env.TAG) names the verified commit ($env.COMMIT)"
+
+      - name: Create the draft Release with every asset
+        if: github.event_name == 'push'
+        shell: nu {0}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.verify.outputs.tag }}
+          PRERELEASE: ${{ needs.verify.outputs.prerelease }}
+          ASSETS: ${{ needs.verify.outputs.release_assets }}
+        run: |
+          let expected = ($env.ASSETS | from json)
+          let actual = (ls dist | get name | path basename)
+          if ($actual | sort) != ($expected | sort) {
+            error make { msg: $"release assets mismatch: expected ($expected | sort | to nuon), got ($actual | sort | to nuon)" }
+          }
+          let files = ($expected | each {|f| $"dist/($f)" })
+          let flags = if $env.PRERELEASE == "true" { [--prerelease] } else { [] }
+          # Drafts are not unique per tag, so a re-run would add a second draft
+          # beside the first. Create only when gh reports that no Release,
+          # draft or published, exists for the tag. Any other answer stops the
+          # job. Runs for one tag are serialized by the concurrency group.
+          let existing = (^gh release view $env.TAG --repo $env.GITHUB_REPOSITORY --json url,isDraft | complete)
+          if $existing.exit_code == 0 {
+            error make { msg: $"a Release for ($env.TAG) already exists: ($existing.stdout | str trim). This job never replaces one. Delete it first if this run should publish." }
+          }
+          if not ($existing.stderr | str contains "release not found") {
+            error make { msg: $"cannot tell whether a Release for ($env.TAG) exists: ($existing.stderr | str trim)" }
+          }
+          (^gh release create $env.TAG ...$files
+            --repo $env.GITHUB_REPOSITORY
+            --draft
+            --verify-tag
+            --title $env.TAG
+            --generate-notes
+            ...$flags)
+          print $"draft Release ($env.TAG) created with ($files | length) assets"
+
+  notify-tap:
+    name: Notify Homebrew tap
+    if: github.event_name == 'release' && !github.event.release.prerelease && !github.event.release.draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The dispatch token lives in this environment, not as a repository secret.
+    environment: homebrew-tap
+    permissions:
+      contents: read
+      attestations: read # Read the provenance of the published checksum file.
+    env:
+      # Secrets cannot appear in `if:`; expose only whether one is set.
+      HAS_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_DISPATCH_TOKEN != '' }}
+    steps:
+      # A release event runs this file as it is at github.sha, the commit the
+      # tag named when the Release was published. Check out that commit, not
+      # the tag, so the code this job runs cannot differ from this file.
+      - name: Checkout the released commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      # Unconditional: the skip step below is Nu too, and this install is the
+      # only source of Nu the job may rely on.
+      - name: Install toolchains from .mise.toml
+        uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+        with:
+          version: 2026.9.9
+          install: true
+          install_args: bun nu gh
+          cache: false
+
+      - name: Skip without a tap dispatch token
+        if: env.HAS_TAP_TOKEN != 'true'
+        shell: nu {0}
+        run: print "HOMEBREW_TAP_DISPATCH_TOKEN not set; tap notification skipped"
+
+      # The step that imports repository code. No token is in its environment.
+      # It shares the runner with the dispatch step, so this guards against an
+      # accident, not against a hostile commit; see the top of this file.
+      - name: Resolve the tap through the release manifest
+        id: release
+        if: env.HAS_TAP_TOKEN == 'true'
+        shell: nu {0}
+        run: |
+          let r = (^bun -e r#'
+          import * as m from "./scripts/lib/release-manifest.ts";
+          const t = m.parseReleaseTag(process.env.RELEASE_TAG ?? "");
+          if (t === null) {
+            console.error(`not a release tag: ${process.env.RELEASE_TAG}`);
+            process.exit(1);
+          }
+          console.log(JSON.stringify({
+            tap: m.HOMEBREW_TAP_REPO,
+            tag: t.tag,
+            version: t.version,
+            checksum_file: m.CHECKSUM_FILE,
+            workflow: m.RELEASE_WORKFLOW_PATH,
+          }));
+          '# | complete)
+          if $r.exit_code != 0 {
+            error make { msg: $"release manifest rejected tag: ($r.stderr)" }
+          }
+          $r.stdout
+          | from json
+          | transpose key value
+          | each {|kv| $"($kv.key)=($kv.value)\n" }
+          | str join
+          | save --append $env.GITHUB_OUTPUT
+
+      # The tap builds from the source archive of the tag. github.sha is the
+      # commit the tag named when the Release was published, so the tag is read
+      # again here. Notify the tap only when the tag names that commit at this
+      # moment and the published assets were built and attested from it. A tag
+      # moved after this step goes unseen here; the dispatch carries the commit
+      # so the tap can compare.
+      - name: Check the Release was built from the released commit
+        if: env.HAS_TAP_TOKEN == 'true'
+        shell: nu {0}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          CHECKSUM_FILE: ${{ steps.release.outputs.checksum_file }}
+          WORKFLOW: ${{ steps.release.outputs.workflow }}
+        run: |
+          # This endpoint follows an annotated tag to its commit.
+          let named = (^gh api $"repos/($env.GITHUB_REPOSITORY)/commits/refs/tags/($env.TAG)" --jq .sha | complete)
+          if $named.exit_code != 0 {
+            error make { msg: $"cannot read tag ($env.TAG): ($named.stderr)" }
+          }
+          let commit = ($named.stdout | str trim)
+          if $commit != $env.GITHUB_SHA {
+            error make { msg: $"tag ($env.TAG) moved: it names ($commit), the Release was published at ($env.GITHUB_SHA)" }
+          }
+          let dir = (mktemp --directory --tmpdir-path $env.RUNNER_TEMP "release-checksums.XXXXXX")
+          let got = (^gh release download $env.TAG --repo $env.GITHUB_REPOSITORY --pattern $env.CHECKSUM_FILE --dir $dir | complete)
+          if $got.exit_code != 0 {
+            error make { msg: $"cannot download ($env.CHECKSUM_FILE) of Release ($env.TAG): ($got.stderr)" }
+          }
+          let proof = (^gh attestation verify ($dir | path join $env.CHECKSUM_FILE)
+            --repo $env.GITHUB_REPOSITORY
+            --signer-workflow $"($env.GITHUB_REPOSITORY)/($env.WORKFLOW)"
+            --source-ref $"refs/tags/($env.TAG)"
+            --source-digest $env.GITHUB_SHA | complete)
+          if $proof.exit_code != 0 {
+            error make { msg: $"Release ($env.TAG) was not built from ($env.GITHUB_SHA), the commit the tag names: ($proof.stderr)" }
+          }
+          print $"Release ($env.TAG) was built from the released commit ($env.GITHUB_SHA)"
+
+      - name: Send repository_dispatch to the tap
+        if: env.HAS_TAP_TOKEN == 'true'
+        shell: nu {0}
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_DISPATCH_TOKEN }}
+          TAP: ${{ steps.release.outputs.tap }}
+          TAG: ${{ steps.release.outputs.tag }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          (^gh api --method POST $"repos/($env.TAP)/dispatches"
+            -f event_type=z3store-release-published
+            -f $"client_payload[tag]=($env.TAG)"
+            -f $"client_payload[version]=($env.VERSION)"
+            -f $"client_payload[commit]=($env.GITHUB_SHA)")
+          print $"dispatched z3store-release-published ($env.TAG) to ($env.TAP)"

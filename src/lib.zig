@@ -35,6 +35,11 @@ pub const initRepo = gs.initRepo;
 pub const isAdopted = gs.isAdopted;
 pub const repoRelativePath = gs.repoRelativePath;
 pub const repoStoragePath = gs.repoStoragePath;
+pub const FormatGhRepoError = gs.FormatGhRepoError;
+pub const formatGhRepo = gs.formatGhRepo;
+pub const ghRepoFromRemoteUrl = gs.ghRepoFromRemoteUrl;
+pub const ghRepoFromGhqPath = gs.ghRepoFromGhqPath;
+pub const resolveGhRepo = gs.resolveGhRepo;
 pub const enumerateLinkedWorktrees = gs.enumerateLinkedWorktrees;
 pub const freeWorktreePaths = gs.freeWorktreePaths;
 pub const rewriteJjGitTarget = gs.rewriteJjGitTarget;
@@ -42,10 +47,10 @@ pub const rewriteJjGitTargetRelative = gs.rewriteJjGitTargetRelative;
 
 test "lib: public url parser smoke" {
     const gpa = std.testing.allocator;
-    var spec = try url.parse(gpa, "github.com/EugOT/z3store", .{});
+    var spec = try url.parse(gpa, "github.com/Eugene3dotdev/z3store", .{});
     defer spec.deinit(gpa);
 
     try std.testing.expectEqualStrings("github.com", spec.host);
-    try std.testing.expectEqualStrings("EugOT", spec.owner);
+    try std.testing.expectEqualStrings("Eugene3dotdev", spec.owner);
     try std.testing.expectEqualStrings("z3store", spec.name);
 }

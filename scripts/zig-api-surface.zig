@@ -1,9 +1,6 @@
 //! zig-api-surface — walk src/lib.zig (or any given .zig file) and emit a
 //! JSON inventory of every top-level `pub fn`, `pub const`, `pub var` decl.
 //!
-//! Adapted from EugOT/gitstore-cli's scripts/zig-api-surface.zig (MIT).
-//! The logic is intentionally the same: a tiny AST walker over root decls.
-//!
 //! Intended use:
 //!   mise x zig@0.16.0 -- zig run scripts/zig-api-surface.zig -- src/lib.zig > api.json
 //!   diff <(git show main:.zig-qm/public-api.txt) api.txt   # PR gate
@@ -121,7 +118,7 @@ fn classifyDecl(ast: std.zig.Ast, decl_idx: std.zig.Ast.Node.Index) ?Entry {
 /// are recognised as public (CEL-456 #5).
 fn hasPubBefore(token_tags: []const std.zig.Token.Tag, tok: std.zig.Ast.TokenIndex) bool {
     if (tok == 0) return false;
-    var i: usize = @as(usize, tok);
+    var i: usize = tok;
     while (i > 0) {
         i -= 1;
         const t = token_tags[i];
@@ -149,7 +146,7 @@ fn findFnNameToken(ast: std.zig.Ast, decl_idx: std.zig.Ast.Node.Index) ?std.zig.
     // `fn foo(...)` — the main token is `fn`; the name is the next identifier.
     const main_tok = ast.nodes.items(.main_token)[@intFromEnum(decl_idx)];
     const token_tags = ast.tokens.items(.tag);
-    var i: usize = @as(usize, main_tok);
+    var i: usize = main_tok;
     const end = @min(i + 4, token_tags.len);
     while (i < end) : (i += 1) {
         if (token_tags[i] == .identifier) return @intCast(i);

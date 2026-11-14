@@ -1,8 +1,17 @@
 const std = @import("std");
+const zon = @import("build.zig.zon");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    // Release archives build with -Dstrip=true so embedded debug paths cannot
+    // make artifacts depend on the build machine's checkout location.
+    const strip = b.option(bool, "strip", "Strip debug info from zt") orelse false;
+
+    // build.zig.zon is the only version source; `zt --version`, the release
+    // archives and check-version-tag.ts all derive from this one field.
+    const build_info = b.addOptions();
+    build_info.addOption([]const u8, "version", zon.version);
 
     const fmt = b.addFmt(.{
         .paths = &.{ "build.zig", "build.zig.zon", "src" },
@@ -23,7 +32,9 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = strip,
     });
+    exe_mod.addOptions("build_info", build_info);
 
     const exe = b.addExecutable(.{
         .name = "zt",
@@ -55,6 +66,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const integration_tests = b.addTest(.{ .root_module = integration_mod });
+    // main.zig is also compiled into this module, so it needs the same
+    // build_info import as exe_mod.
+    integration_mod.addOptions("build_info", build_info);
 
     // The integration suite includes e2e tests that spawn the real `zt`
     // binary, so it must be built first. `dependOn(&exe.step)` guarantees the
@@ -95,13 +109,13 @@ pub fn build(b: *std.Build) void {
     const integration_step = b.step("test-integration", "Run integration/e2e tests");
     integration_step.dependOn(&run_integration.step);
 
-    // Fuzzing in Zig 0.16 is driven by the build runner's `--fuzz` flag.
-    // This step prepares the full test graph so the runner can discover
-    // project fuzz targets and rerun the relevant test binaries in fuzz mode.
-    const fuzz_step = b.step("fuzz", "Prepare fuzz-capable test runs");
-    fuzz_step.dependOn(&run_unit.step);
-    fuzz_step.dependOn(&run_lib.step);
-    fuzz_step.dependOn(&run_integration.step);
+    // Fuzzing in Zig 0.16 is driven by the build runner's `--fuzz` flag, which
+    // fuzzes every test binary under this step at once. A fuzz test compiled
+    // into two binaries makes both lock the same corpus and the loser panics,
+    // so this step runs one binary. `src/tests.zig` imports every module, so
+    // the integration binary holds every fuzz test.
+    const fuzz_step = b.step("fuzz", "Prepare the fuzz-capable test run");
+    fuzz_step.dependOn(&b.addRunArtifact(addFuzzTests(b, integration_tests)).step);
 
     const docs_install = b.addInstallDirectory(.{
         .source_dir = lib_tests.getEmittedDocs(),
@@ -110,4 +124,40 @@ pub fn build(b: *std.Build) void {
     });
     const docs_step = b.step("docs", "Install generated API docs");
     docs_step.dependOn(&docs_install.step);
+}
+
+/// Returns a copy of `tests` for the `fuzz` step only, with error tracing off
+/// and the LLVM backend forced.
+///
+/// Zig 0.16.0 cannot compile a `std.testing.fuzz` target in fuzz mode while
+/// error tracing is on: `lib/compiler/test_runner.zig:566` hands the
+/// `*std.builtin.StackTrace` from `@errorReturnTrace()` to
+/// `std.debug.writeStackTrace`, which takes `*const std.debug.StackTrace`.
+/// Upstream master calls `writeErrorReturnTrace` there. `zig build test` keeps
+/// tracing. Delete this and wire the plain test runs into `fuzz` once the
+/// pinned Zig carries that fix.
+fn addFuzzTests(b: *std.Build, tests: *std.Build.Step.Compile) *std.Build.Step.Compile {
+    const source = tests.root_module;
+    const mod = b.createModule(.{
+        .root_source_file = source.root_source_file,
+        .target = source.resolved_target,
+        .optimize = source.optimize,
+        .error_tracing = false,
+    });
+    for (source.import_table.keys(), source.import_table.values()) |name, import| {
+        mod.addImport(name, import);
+    }
+    const fuzz_tests = b.addTest(.{
+        .root_module = mod,
+        // Zig 0.16.0 builds Debug x86_64 with its own backend by default,
+        // and that backend emits no coverage instrumentation. The fuzzer
+        // then runs blind and the build runner rejects its coverage file
+        // ("pcs_len was zero"). The LLVM backend instruments every target.
+        .use_llvm = true,
+    });
+    // Explicit edges only, such as the `zt` binary the e2e tests spawn.
+    for (tests.step.dependencies.items) |dependency| {
+        fuzz_tests.step.dependOn(dependency);
+    }
+    return fuzz_tests;
 }
