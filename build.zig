@@ -94,6 +94,19 @@ pub fn build(b: *std.Build) void {
     const lib_tests = b.addTest(.{ .root_module = z3store_mod });
     const run_lib = b.addRunArtifact(lib_tests);
 
+    // scripts/kcov-coverage.ts runs these three binaries under kcov. Zig
+    // 0.16.0's self-hosted x86_64 backend (the Debug default) writes DWARF
+    // whose line tables kcov 43 cannot read, so the report holds only std
+    // files; LLVM's DWARF is conventional. kcov also parses a PIE main file
+    // only after its preload helper reports the load address, which races a
+    // short-lived process, so a fixed-address executable is parsed up front.
+    if (target.result.os.tag == .linux) {
+        for ([_]*std.Build.Step.Compile{ unit_tests, lib_tests, integration_tests }) |t| {
+            t.use_llvm = true;
+            t.pie = false;
+        }
+    }
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&run_unit.step);
     test_step.dependOn(&run_lib.step);

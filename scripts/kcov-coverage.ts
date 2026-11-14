@@ -107,8 +107,10 @@ function runKcov(
 	binary: string,
 ): { code: number; log: string } {
 	const args = [
+		// Count only this repository's src/; the Zig toolchain's std lives
+		// wherever mise installs it, which no exclude pattern can name.
+		`--include-path=${resolve(repoRoot(), "src")}`,
 		`--exclude-pattern=${EXCLUDE_PATTERNS.join(",")}`,
-		"--timeout=120000",
 		outDir,
 		binary,
 	];
@@ -194,17 +196,29 @@ export async function measure(): Promise<CoverageSummary> {
 		if (!binary) {
 			throw new Error(`failed to build ${step}:\n${tail(log)}`);
 		}
+		// Tests decide, kcov measures. kcov sometimes exits nonzero on a binary
+		// whose tests all pass (test-unit spawns failing child processes), so
+		// the binary's own exit judges the tests, and kcov's exit fails the
+		// job only when kcov left no readable report.
+		const direct = spawnSync([binary]);
+		if (direct.code !== 0) {
+			throw new Error(
+				`${step} failed (exit ${direct.code ?? 1}):\n${tail(`${direct.stdout}\n${direct.stderr}`)}`,
+			);
+		}
 		const outDir = resolve(covRoot, step);
 		mkdirSync(outDir, { recursive: true });
 		const { code, log: klog } = runKcov(outDir, binary);
-		if (code !== 0) {
-			throw new Error(`kcov failed on ${step} (exit ${code}):\n${tail(klog)}`);
-		}
 		runDirs.push(outDir);
 		const run = await readKcovRun(outDir);
 		if (!run) {
 			throw new Error(
-				`kcov completed for ${step} but no readable coverage.json was found in ${outDir}`,
+				`kcov exited ${code} on ${step} and no readable coverage.json was found in ${outDir}:\n${tail(klog)}`,
+			);
+		}
+		if (code !== 0) {
+			console.warn(
+				`kcov-coverage: warning: kcov exited ${code} on ${step} (${binary}); its report was read and the tests passed when run directly`,
 			);
 		}
 		perBinary[step] = {
@@ -221,7 +235,8 @@ export async function measure(): Promise<CoverageSummary> {
 			`kcov merge failed (exit ${mergeCode}):\n${tail(mergeLog)}`,
 		);
 	}
-	const merged = await readKcovRun(mergedDir);
+	// `kcov --merge <dir>` writes its report to <dir>/kcov-merged/.
+	const merged = await readKcovRun(resolve(mergedDir, "kcov-merged"));
 	if (!merged) {
 		throw new Error(
 			`kcov merge completed but no readable coverage.json was found in ${mergedDir}`,
